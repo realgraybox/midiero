@@ -32,6 +32,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -57,7 +58,7 @@
 //end xfileselect area
 
 #define SAMPLE_RATE 48000		//48000 more universal than 44100
-#define BUFFER_SIZE 1024		//2048 needed for large resolution
+#define BUFFER_SIZE 2048		//2048 needed for large resolution when non-threaded
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 600
 #define TARGET_FPS              80
@@ -97,9 +98,8 @@ bool g_is_paused = false;
 bool g_channels_enabled[16];
 
 #ifdef THREAD
-static double g_graphic_time_start = 0.0;
-static double g_graphic_time_end = 0.0;
-static double g_graphic_wall_start = 0.0;
+static double g_graphic_time = 0.0;
+static double g_graphic_wall_time = 0.0;
 #endif
 
 int g_channel_programs[16] = {0}; // Default preset 0 (Piano) for all channels
@@ -108,8 +108,8 @@ bool g_channel_has_played[16] = {false}; // Checking whether the track actually 
 char g_nuvaerende_midi_navn[256] = "No MIDI loaded - Use key [L]";
 char g_nuvaerende_sf2_navn[256]  = "Build in Nokia Bank (Default)";
 
-bool g_node_mode = true; // True = Node mode, False = Hero mode
-bool g_show_bars = false; // True = show duration bars, False = hide them
+bool g_node_mode = true; 	// True = Node mode, False = Hero mode
+bool g_show_bars = false; 	// True = show duration bars, False = hide them
 
 #ifdef THREAD
 static tml_message *g_current_msg = NULL;
@@ -161,7 +161,6 @@ static double get_monotonic_ms(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 }
-
 #endif
 
 // Function to dynamically load/switch a MIDI file
@@ -275,11 +274,8 @@ static void *audio_thread(void *arg) {
 
             tsf_render_short(*tsf_ptr, sample_buffer, BUFFER_SIZE, 0);
 
-            pthread_mutex_unlock(&audio_mutex);    
-			g_graphic_time_start = g_time_ms;
-			g_graphic_time_end = next_time_ms;
-			g_graphic_wall_start = get_monotonic_ms();
-
+			pthread_mutex_unlock(&audio_mutex);
+            
             if (audio_write(sample_buffer, BUFFER_SIZE) < 0) {
                 perror("audio_write");
                 audio_error = 1;
@@ -292,9 +288,10 @@ static void *audio_thread(void *arg) {
 				g_time_ms = 0.0;
 				g_is_paused = true;
 				g_current_msg = g_midi;
-				g_graphic_time_start = 0.0;
-				g_graphic_time_end = 0.0;
-				g_graphic_wall_start = get_monotonic_ms();
+				
+				g_graphic_time = 0.0;
+				g_graphic_wall_time = get_monotonic_ms();
+				
 				printf("The song is over. Rewinds to the start and pauses.\n");
 			}
         } else {
@@ -307,11 +304,9 @@ static void *audio_thread(void *arg) {
                 running = false;
                 break;
             }
-
             usleep(10000);
         }
     }
-
     return NULL;
 }
 
@@ -400,13 +395,38 @@ int main(int argc, char *argv[]) {
                 if (keysym == XK_Escape || keysym == XK_q || keysym == XK_Q) {
                     running = false;
                 } else if (keysym == XK_space) {
+#ifdef THREAD					
+					pthread_mutex_lock(&audio_mutex);
+					
                     g_is_paused = !g_is_paused;
+                    g_graphic_wall_time = get_monotonic_ms();
+                    
+                    pthread_mutex_unlock(&audio_mutex);
+#else
+					g_is_paused = !g_is_paused;
+#endif                 
                 } else if (keysym == XK_Up) {
+#ifdef THREAD
+					pthread_mutex_lock(&audio_mutex);
+					g_speed_modifier += 0.1;
+					if (g_speed_modifier > 2.5)
+						g_speed_modifier = 2.5;
+					pthread_mutex_unlock(&audio_mutex);
+#else					
                     g_speed_modifier += 0.1;
                     if (g_speed_modifier > 2.5) g_speed_modifier = 2.5;
+#endif
                 } else if (keysym == XK_Down) {
+#ifdef THREAD
+					pthread_mutex_lock(&audio_mutex);
+					g_speed_modifier -= 0.1;
+					if (g_speed_modifier < 0.1)
+						g_speed_modifier = 0.1;
+					pthread_mutex_unlock(&audio_mutex);
+#else
                     g_speed_modifier -= 0.1;
                     if (g_speed_modifier < 0.1) g_speed_modifier = 0.1;
+#endif
 				}
 				else if (keysym == XK_t || keysym == XK_T) {
 					g_node_mode = !g_node_mode; // Switch between Hero and Node view!
@@ -434,14 +454,12 @@ int main(int argc, char *argv[]) {
 
 						g_is_paused = true;
 						tsf_note_off_all(g_tsf);
-						g_midi = skift_midi_fil(midi_path, g_midi, & g_graphic_time_start);
+						g_midi = skift_midi_fil(midi_path, g_midi, &g_time_ms);
 						g_current_msg = g_midi;
 
 						g_time_ms = 0.0;
-
-						g_graphic_time_start = 0.0;
-						g_graphic_time_end = 0.0;
-						g_graphic_wall_start = get_monotonic_ms();
+						g_graphic_time = 0.0;
+						g_graphic_wall_time = get_monotonic_ms();
 
 						pthread_mutex_unlock(&audio_mutex);
 #else
@@ -500,32 +518,43 @@ int main(int argc, char *argv[]) {
 					target_channel = 9; // Yields 9 (track 10)
 				}
                 // 4. If a valid channel was pressed, toggle its status.
+#ifdef THREAD                
                 if (target_channel >= 0 && target_channel < 16) {
+					pthread_mutex_lock(&audio_mutex);
+					
                     g_channels_enabled[target_channel] = !g_channels_enabled[target_channel];
                     if (!g_channels_enabled[target_channel]) {
-#ifdef THREAD
-						pthread_mutex_lock(&audio_mutex);
 						tsf_channel_note_off_all(g_tsf, target_channel);
-						pthread_mutex_unlock(&audio_mutex);
+					}
+					pthread_mutex_unlock(&audio_mutex);
+				}
 #else
+				if (target_channel >= 0 && target_channel < 16) {
+                    g_channels_enabled[target_channel] = !g_channels_enabled[target_channel];
+                    if (!g_channels_enabled[target_channel]) {
 						tsf_channel_note_off_all(g_tsf, target_channel);
-#endif
                     }
                 }
+#endif                
             }
         }
 #ifdef THREAD
-		double graphic_time_ms = g_graphic_time_start;
+		double now = get_monotonic_ms();
 
-		if (!g_is_paused) {
-			double elapsed = get_monotonic_ms() - g_graphic_wall_start;
+		pthread_mutex_lock(&audio_mutex);
 
-			graphic_time_ms =	g_graphic_time_start + elapsed * g_speed_modifier;
+		double graphic_time_ms = g_graphic_time;
 
-			if (graphic_time_ms > g_graphic_time_end)
-				graphic_time_ms = g_graphic_time_end;
+		if (!g_is_paused && g_graphic_wall_time > 0.0) {
+			graphic_time_ms +=
+				(now - g_graphic_wall_time) * g_speed_modifier;
 		}
-        
+
+		g_graphic_time = graphic_time_ms;
+		g_graphic_wall_time = now;	
+		
+		pthread_mutex_unlock(&audio_mutex);	
+  
 #else //THREADS  
         // Pause and go back to start
         if (g_midi != NULL && current_msg == NULL && tsf_active_voice_count(g_tsf) == 0) {
@@ -682,7 +711,7 @@ int main(int argc, char *argv[]) {
             
 			tml_message* scan = g_midi;
             while (scan) {
-                if (scan->type == TML_NOTE_ON && scan->velocity > 0 && g_channels_enabled[scan->channel]) {
+                if (scan->type == TML_NOTE_ON && scan->velocity > 0 && g_channels_enabled[scan->channel]) {		
 #ifdef THREAD
 					int x_pos = dynamic_center_x + (int)((scan->time - graphic_time_ms) *  0.1 /*/ g_speed_modifier*/);
 #else

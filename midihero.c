@@ -1,26 +1,3 @@
-/*
- * Copyright (C) 2026 M. Glargaard, aka graybox
- *
- * This software is provided "as-is", without any express or implied
- * warranty. In no event will the authors be held liable for any damages
- * arising from the use of this software.
- *
- * Permission is granted to anyone to use this software for any purpose,
- * including commercial applications, and to alter it and redistribute it
- * freely, subject to the following restrictions:
- *
- * 1. The origin of this software must not be misrepresented; you must not
- *    claim that you wrote the original software. If you use this software
- *    in a product, an acknowledgment in the product documentation would
- *    be appreciated but is not required.
- *
- * 2. Altered source versions must be plainly marked as such, and must not
- *    be misrepresented as being the original software.
- *
- * 3. This notice may not be removed or altered from any source distribution.
- */
-//midihero.c
-
 #define TSF_IMPLEMENTATION
 #include "tsf.h"
 
@@ -372,6 +349,14 @@ int main(int argc, char *argv[]) {
     XMapWindow(display, window);
     set_window_icon(display, window);
 
+    // --- NEW CODE: Tell X11 that we want to handle the close button (X) ourselves ---
+	Atom wm_delete_window;
+	// 1. Tell X11 that we want to access the "WM_DELETE_WINDOW" atom
+	wm_delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
+
+	// 2. Register this atom as a protocol on your window
+	XSetWMProtocols(display, window, &wm_delete_window, 1);
+
     GC gc = XCreateGC(display, window, 0, NULL);
     Pixmap pixmap = XCreatePixmap(display, window, WINDOW_WIDTH, WINDOW_HEIGHT, DefaultDepth(display, screen));
 
@@ -390,6 +375,13 @@ int main(int argc, char *argv[]) {
         while (XPending(display)) {
             XEvent event;
             XNextEvent(display, &event);
+            // Allows the game to be closed using the window's "X" button with the mouse.
+			if (event.type == ClientMessage) {
+				if ((Atom)event.xclient.data.l[0] == wm_delete_window) {
+					running = false;
+				}
+				break; 
+			}
             if (event.type == KeyPress) {
                 KeySym keysym = XLookupKeysym(&event.xkey, 0);
                 if (keysym == XK_Escape || keysym == XK_q || keysym == XK_Q) {

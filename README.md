@@ -1,8 +1,8 @@
-# MIDI-Hero
+# midiero
 
 A lightweight, interactive MIDI visualization and music learning tool for Linux. Built from scratch in pure C using **Xlib** for graphics and **TinyALSA** for real-time sound generation via an embedded SoundFont. 
 
-Conceptually inspired by games like *Guitar Hero*, **MIDI-Hero** focuses on helping users see, hear, and learn music through proper musical notation rather than abstract blocks.
+Conceptually inspired by games like *Guitar Hero*, **midiero** focuses on helping users see, hear, and learn music through proper musical notation rather than abstract blocks.
 
 With a fully static build utilizing `uclibc`, the entire application—including its internal SoundFont synthesizer—compiles into a standalone binary of **around 400 KB**, making it exceptionally resource-efficient and portable.
 
@@ -33,7 +33,7 @@ With a fully static build utilizing `uclibc`, the entire application—including
 
 ## Architecture & Dependencies
 
-MIDI-Hero is crafted to be completely independent of bloated desktop frameworks (like GTK or Qt) and external server-side synths. 
+midiero is crafted to be completely independent of bloated desktop frameworks (like GTK or Qt) and external server-side synths. 
 
 - **Graphics & Input:** Pure X11 / Xlib
 - **MIDI Parsing:** `tml.h` (Tiny MIDI Loader)
@@ -50,15 +50,15 @@ OSS only, TinyALSA only or both is possible. If both are compiled in via -DAUDIO
 
 ## Usage
 
-Simply launch the executable. If no arguments are provided, MIDI-Hero boots instantly using its internal SoundFont and prompts you to select a song:
+Simply launch the executable. If no arguments are provided, midiero boots instantly using its internal SoundFont and prompts you to select a song:
 
 ```bash
-./midi-hero
+./midiero
 ```
 
 Alternatively, pass files directly as command-line arguments:
 ```bash
-./midi-hero song.mid custom_bank.sf2
+./midiero song.mid custom_bank.sf2
 ```
 
 ## License

@@ -26,11 +26,11 @@ $(error Unsupported target: $(TARGET_MACHINE))
 
 endif
 
-SRCS = midihero.c audio/audio.c audio/pcm.c
+SRCS = midiero.c audio/audio.c audio/pcm.c
 
 OBJS= $(SRCS:.c=.o)
 
-TARGET = midihero
+TARGET = midiero
 
 CFLAGS += -Os -Wall -Wshadow -Wextra -Wno-deprecated-declarations \
 			--std=gnu99 -ffunction-sections -fdata-sections \

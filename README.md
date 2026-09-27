@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/91d5e461-0ca1-4e39-be96-81390f5f4d5e
+
 # midiero
 
 A lightweight, interactive MIDI visualization and music learning tool for Linux. Built from scratch in pure C using **Xlib** for graphics and **TinyALSA** for real-time sound generation via an embedded SoundFont. 

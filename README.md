@@ -10,6 +10,8 @@ Conceptually inspired by games like *Guitar Hero*, **midiero** focuses on helpin
 
 With a fully static build utilizing `uclibc`, the entire application—including its internal SoundFont synthesizer—compiles into a standalone binary of **around 400 KB**, making it exceptionally resource-efficient and portable.
 
+Not related to SpyderTL/MidiHero, a Windows practice utility for isolating instrument tracks — midiero is a Linux-native, dependency-free MIDI visualizer with live notation.
+
 ## Features
 
 - **Live Musical Notation (Node Mode):** Renders notes onto an intelligent double-staff (Treble and Bass clefs) with dynamic support for accidentals (`#`) and ledger lines.

@@ -162,13 +162,83 @@ static double get_monotonic_ms(void) {
 }
 #endif
 
+// Function that finds the raw MIDI data inside a RIFF container
+unsigned char* unwrap_riff_midi(unsigned char* data, unsigned int* size) {
+
+    if (*size < 20) return data;
+
+
+    if (memcmp(data, "RIFF", 4) == 0 && memcmp(data + 8, "RMID", 4) == 0){
+        unsigned int offset = 12;
+        
+        while (offset + 8 < *size) {
+            unsigned int chunk_size = data[offset + 4] | 
+                                      (data[offset + 5] << 8) | 
+                                      (data[offset + 6] << 16) | 
+                                      (data[offset + 7] << 24);
+            
+            if (memcmp(data + offset, "data", 4) == 0) {
+                if (offset + 8 + chunk_size <= *size) {
+                    *size = chunk_size;
+                    return data + offset + 8;
+                }
+            }
+            offset += 8 + ((chunk_size + 1) & ~1);
+        }
+    }
+    return data;
+}
+
 // Function to dynamically load/switch a MIDI file
 tml_message* skift_midi_fil(const char* sti, tml_message* gammel_midi, double* afspilnings_tid) {
     if (gammel_midi) {
         tml_free(gammel_midi); // Free the old song from RAM
-    }
-    
-    tml_message* ny_midi = tml_load_filename(sti);
+    // RIFF (little-endian) data guard
+	FILE* f = fopen(sti, "rb");
+	if (!f) {
+		fprintf(stderr, "Could not open file %s\n",sti);
+		return NULL;
+	}
+	fseek(f, 0, SEEK_END);
+	unsigned int file_size = ftell(f);
+	fseek(f, 0, SEEK_SET);
+
+	unsigned char* file_buffer = (unsigned char*)malloc(file_size);
+	if (!file_buffer) {
+		fprintf(stderr, "Could not allocate memory.\n");
+		fclose(f);
+		return NULL;
+	}
+
+	size_t bytes_read = fread(file_buffer, 1, file_size, f);
+	fclose(f);
+	
+	if (bytes_read != file_size) {
+		fprintf(stderr, "Could not read the entire file (read %zu of %u bytes).\n", bytes_read, file_size);
+		free(file_buffer);
+		return NULL;
+	}
+
+	// RMID-unpack
+	unsigned int midi_size = file_size;
+	unsigned char* raw_midi_ptr = unwrap_riff_midi(file_buffer, &midi_size);
+	
+	// check midi format - only 0 and 1 supported
+	if (midi_size >= 14 && memcmp(raw_midi_ptr, "MThd", 4) == 0)  {
+		unsigned short midi_format = (raw_midi_ptr[8] << 8) | raw_midi_ptr[9];
+
+		if (midi_format > 1) {
+			fprintf(stderr, "%s: MIDI format %u unsupported\n", sti, midi_format);
+			snprintf(g_nuvaerende_midi_navn, sizeof(g_nuvaerende_midi_navn), "MIDI format %u unsupported", midi_format);
+			free(file_buffer);
+			return NULL;
+		}
+	}
+
+	// use tml_load_memory instead of tml_load_filename
+	tml_message *ny_midi = tml_load_memory(raw_midi_ptr, midi_size);
+
+  //  tml_message* ny_midi = tml_load_filename(sti);
     if (!ny_midi) {
         snprintf(g_nuvaerende_midi_navn, sizeof(g_nuvaerende_midi_navn), "Error loading!");
         return NULL;

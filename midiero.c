@@ -368,6 +368,151 @@ static void reset_channels(tsf* f) {
     }
 }
 
+// =========================================================================
+// NOTE TABLE (graphics only - built and used by the main thread)
+// =========================================================================
+// Every note's start and end is worked out once per song, so drawing never has to
+// search the MIDI list for note-offs. The table is sorted by start time (the MIDI
+// list is), so a frame can binary-search the first visible note and stop at the
+// right edge of the window.
+typedef struct {
+    double start_ms;
+    double end_ms;			// < 0: no note-off found (drawn as head only, like before)
+    unsigned char channel, key;
+} node_t;
+
+static node_t* g_noder = NULL;
+static int g_node_antal = 0;
+static double g_max_node_ms = 0.0;	// longest note: how far back a visible bar can start
+
+static void byg_node_tabel(const tml_message* midi) {
+    static int aaben[16][128];	// newest open note per channel/key (-1 = none) ...
+    int antal = 0;
+
+    free(g_noder);
+    g_noder = NULL;
+    g_node_antal = 0;
+    g_max_node_ms = 0.0;
+
+    for (const tml_message* m = midi; m; m = m->next)
+        if (m->type == TML_NOTE_ON && m->velocity > 0 && m->channel < 16) antal++;
+    if (antal == 0) return;
+
+    g_noder = (node_t*)malloc((size_t)antal * sizeof(node_t));
+    int* forrige = (int*)malloc((size_t)antal * sizeof(int));	// ... chained to the older open ones
+    if (!g_noder || !forrige) {
+        fprintf(stderr, "Out of memory for the note table\n");
+        free(g_noder);
+        free(forrige);
+        g_noder = NULL;
+        return;
+    }
+    for (int c = 0; c < 16; c++)
+        for (int k = 0; k < 128; k++) aaben[c][k] = -1;
+
+    for (const tml_message* m = midi; m; m = m->next) {
+        if (m->type != TML_NOTE_ON && m->type != TML_NOTE_OFF) continue;
+        if (m->channel >= 16) continue;
+        int ch = m->channel, key = m->key & 0x7F;
+
+        if (m->type == TML_NOTE_ON && m->velocity > 0) {
+            node_t* n = &g_noder[g_node_antal];
+            n->start_ms = m->time;
+            n->end_ms = -1.0;
+            n->channel = (unsigned char)ch;
+            n->key = (unsigned char)key;
+            forrige[g_node_antal] = aaben[ch][key];
+            aaben[ch][key] = g_node_antal++;
+        } else {
+            // A note-off ends every open note of this key, exactly like the old
+            // per-frame look-ahead (which took the first note-off after each note-on)
+            for (int i = aaben[ch][key]; i >= 0; i = forrige[i]) {
+                g_noder[i].end_ms = m->time;
+                double d = m->time - g_noder[i].start_ms;
+                if (d > g_max_node_ms) g_max_node_ms = d;
+            }
+            aaben[ch][key] = -1;
+        }
+    }
+    free(forrige);
+}
+
+// Index of the first note starting at or after t
+static int foerste_node_fra(double t) {
+    int lo = 0, hi = g_node_antal;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (g_noder[mid].start_ms < t) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+// =========================================================================
+// BATCHED DRAWING: a colour change and a few X requests per channel, instead
+// of several requests and a colour change per note. Drawn in layers: all
+// duration bars, then all noteheads and sharps, then the ledger lines - so a
+// bar never covers a notehead.
+// =========================================================================
+#define BATCH 256
+
+typedef struct {
+    XRectangle bars[BATCH];		// duration bars (node mode) / blocks (hero mode)
+    XSegment   ends[BATCH];		// end marks of the duration bars
+    XArc       heads[BATCH];	// noteheads
+    XPoint     sharps[BATCH];	// position of each '#'
+    int n_bars, n_ends, n_heads, n_sharps;
+} kanal_batch_t;
+
+static kanal_batch_t g_batch[16];
+static XSegment g_ledger_c[BATCH], g_ledger_ydre[BATCH];	// middle-C ledger / outer ledger lines
+static int g_n_ledger_c = 0, g_n_ledger_ydre = 0;
+
+// Send everything collected so far, layer by layer, and empty the batches
+static void tegn_batches(Display* d, Drawable p, GC gc) {
+    for (int ch = 0; ch < 16; ch++) {				// 1. bars and their end marks
+        kanal_batch_t* b = &g_batch[ch];
+        if (!b->n_bars && !b->n_ends) continue;
+        XSetForeground(d, gc, hent_kanal_farve(ch));
+        if (b->n_bars) XFillRectangles(d, p, gc, b->bars, b->n_bars);
+        if (b->n_ends) XDrawSegments(d, p, gc, b->ends, b->n_ends);
+        b->n_bars = b->n_ends = 0;
+    }
+    for (int ch = 0; ch < 16; ch++) {				// 2. noteheads and sharps
+        kanal_batch_t* b = &g_batch[ch];
+        if (!b->n_heads && !b->n_sharps) continue;
+        XSetForeground(d, gc, hent_kanal_farve(ch));
+        if (b->n_heads) XFillArcs(d, p, gc, b->heads, b->n_heads);
+        for (int i = 0; i < b->n_sharps; i++)
+            XDrawString(d, p, gc, b->sharps[i].x, b->sharps[i].y, "#", 1);
+        b->n_heads = b->n_sharps = 0;
+    }
+    if (g_n_ledger_c) {								// 3. ledger lines
+        XSetForeground(d, gc, 0x666666);
+        XDrawSegments(d, p, gc, g_ledger_c, g_n_ledger_c);
+        g_n_ledger_c = 0;
+    }
+    if (g_n_ledger_ydre) {
+        XSetForeground(d, gc, 0x444444);
+        XDrawSegments(d, p, gc, g_ledger_ydre, g_n_ledger_ydre);
+        g_n_ledger_ydre = 0;
+    }
+}
+
+// Batch of a channel with room for one more note of each kind (sends all early if full)
+static kanal_batch_t* batch_til(Display* d, Drawable p, GC gc, int ch) {
+    kanal_batch_t* b = &g_batch[ch];
+    if (b->n_bars >= BATCH || b->n_ends >= BATCH || b->n_heads >= BATCH || b->n_sharps >= BATCH)
+        tegn_batches(d, p, gc);
+    return b;
+}
+
+static void tilfoej_ledger(Display* d, Drawable p, GC gc, bool midter_c, int x1, int x2, int y) {
+    if (g_n_ledger_c >= BATCH || g_n_ledger_ydre >= BATCH) tegn_batches(d, p, gc);
+    XSegment* sg = midter_c ? &g_ledger_c[g_n_ledger_c++] : &g_ledger_ydre[g_n_ledger_ydre++];
+    sg->x1 = (short)x1; sg->x2 = (short)x2;
+    sg->y1 = sg->y2 = (short)y;
+}
+
 // Function to load a MIDI file. Returns the new song, or NULL on failure.
 // The caller swaps it in and frees the old song, so a failed load keeps the current song.
 tml_message* skift_midi_fil(const char* sti) {
@@ -520,6 +665,7 @@ int main(int argc, char *argv[]) {
     if (argc >= 2) {
         // If there is an argument, we always assume it is a MIDI file
         g_midi = skift_midi_fil(argv[1]);
+        byg_node_tabel(g_midi);
         g_time_ms = 0.0;
 
 #ifdef THREAD
@@ -538,6 +684,7 @@ int main(int argc, char *argv[]) {
     if (!g_tsf) {
         audio_close();
         tml_free(g_midi);
+        free(g_noder);
         return 1;
     }
 
@@ -547,6 +694,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: Could not open X display\n");
         audio_close();
         tml_free(g_midi);
+        free(g_noder);
         tsf_close(g_tsf);
         return 1;
     }
@@ -556,7 +704,10 @@ int main(int argc, char *argv[]) {
                                         10, 10, WINDOW_WIDTH, WINDOW_HEIGHT, 1,
                                         BlackPixel(display, screen), BlackPixel(display, screen));
 
-    XSelectInput(display, window, ExposureMask | KeyPressMask);
+    // StructureNotifyMask: the window size arrives as ConfigureNotify events, so we
+    // never have to ask the X server for it (a full round trip) every frame.
+    XSelectInput(display, window, ExposureMask | KeyPressMask | StructureNotifyMask);
+    int win_w = WINDOW_WIDTH, win_h = WINDOW_HEIGHT;
     XStoreName(display, window, "Midiero - The Interactive MIDI player");
     
     XMapWindow(display, window);
@@ -598,6 +749,11 @@ int main(int argc, char *argv[]) {
 				if ((Atom)event.xclient.data.l[0] == wm_delete_window) {
 					running = false;
 				}
+			}
+			// The window was resized (or the window manager placed it at another size)
+			if (event.type == ConfigureNotify && event.xconfigure.width > 0 && event.xconfigure.height > 0) {
+				win_w = event.xconfigure.width;
+				win_h = event.xconfigure.height;
 			}
             if (event.type == KeyPress) {
                 KeySym keysym = XLookupKeysym(&event.xkey, 0);
@@ -679,6 +835,7 @@ int main(int argc, char *argv[]) {
 							pthread_mutex_unlock(&audio_mutex);
 #endif
 							tml_free(gammel_midi); // the audio thread no longer references it
+							byg_node_tabel(g_midi); // graphics only: no lock needed
                         }
                     }
 				}
@@ -814,11 +971,9 @@ int main(int argc, char *argv[]) {
         // 7. FULLY DYNAMIC & SCALABLE GRAPHICS (Xlib resizing supported)
         // =========================================================================
         
-        // Get the current window dimensions in real time (if the user has resized the window)
-        XWindowAttributes g_attrs;
-        XGetWindowAttributes(display, window, &g_attrs);
-        int W = g_attrs.width;
-        int H = g_attrs.height;
+        // Current window dimensions (kept up to date by ConfigureNotify events)
+        int W = win_w;
+        int H = win_h;
 
 		// If the window size has changed, free the old pixmap and create a new one
         // (This ensures that double-buffering works in full-screen mode)
@@ -888,76 +1043,79 @@ int main(int argc, char *argv[]) {
             int node_w = (H > 700) ? 18 : 14;
             int node_h = (H > 700) ? 10 : 8;
 
-			// --- CALCULATE NODE DURATION (RUN ONLY IF BEAMS ARE ENABLED) ---
-            int node_laengde_pixels = node_w; // Standard minimum width (head only)
-            
-			tml_message* scan = g_midi;
-            while (scan) {
-                if (scan->type == TML_NOTE_ON && scan->velocity > 0 && g_channels_enabled[scan->channel]) {		
-                    int x_pos = dynamic_center_x + (int)((scan->time - graphic_time_ms) * 0.1);
-                    int trin = hent_node_trin(scan->key);
-                    int y_pos = center_y - (trin * linje_afstand / 2);
+			// Only notes that can be on screen: the first candidate is found by binary
+			// search (notes are sorted by start time); the loop stops at the right edge.
+			// With bars on, a note that started up to g_max_node_ms earlier can still show.
+			double venstre_ms = (dynamic_center_x - play_x_start + 40) / 0.1;
+			double t_min = graphic_time_ms - venstre_ms - (g_show_bars ? g_max_node_ms : 0.0);
 
-                    // --- CALCULATE THE DURATION OF THE NOTE (LENGTH OF THE BEAM) ---
-                    node_laengde_pixels = 16; // Standard minimum width (head only)
-				
-					tml_message* lookahead = scan->next;
-						
-					if (g_show_bars) {
-						lookahead = scan->next;
-						while (lookahead) {
-							// Stop the scanning if we find the switch-off message for the exact same channel and tone.
-							if ((lookahead->type == TML_NOTE_OFF || (lookahead->type == TML_NOTE_ON && lookahead->velocity == 0))
-										&& lookahead->channel == scan->channel 
-										&& lookahead->key == scan->key) {
-										
-								double varighed_ms = lookahead->time - scan->time;
-								node_laengde_pixels = (int)(varighed_ms * 0.1); // 1ms = 0.2px
-								if (node_laengde_pixels < node_w) node_laengde_pixels = node_w;
-									break;
-								}
-								lookahead = lookahead->next;
-						}
-					}
+			for (int i = foerste_node_fra(t_min); i < g_node_antal; i++) {
+				const node_t* n = &g_noder[i];
+				int x_pos = dynamic_center_x + (int)((n->start_ms - graphic_time_ms) * 0.1);
+				if (x_pos >= W) break; // all later notes start even further right
+				if (!g_channels_enabled[n->channel]) continue;
 
-					// Calculate where the bar ends (if g_show_bars is false, x_end is simply equal to the end of the notehead).
-					int x_ende = x_pos + node_laengde_pixels;
+				int trin = hent_node_trin(n->key);
+				int y_pos = center_y - (trin * linje_afstand / 2);
+				if (y_pos <= top_h || y_pos >= play_bottom_y) continue;
 
-					// Draw only if the note or its beam is visible on the playing area.
-					
-					if (x_ende > play_x_start && x_pos < W && y_pos > top_h && y_pos < play_bottom_y) {
-								unsigned long kanal_farve = hent_kanal_farve(scan->channel);
-								XSetForeground(display, gc, kanal_farve);
-
-						// 1. Draw the duration bar itself (ONLY if the toggle sequence is ON and it is actually longer than the head)
-						if (g_show_bars && node_laengde_pixels > node_w) {
-							// We draw a nice horizontal beam that starts at the notehead and extends to the right.
-							XFillRectangle(display, pixmap, gc, x_pos + (node_w / 2), y_pos - 2, node_laengde_pixels - (node_w / 2), 4);
-									
-							// Draw a small vertical end line at the end of the beam.
-							XDrawLine(display, pixmap, gc, x_ende, y_pos - 4, x_ende, y_pos + 4);
-						}
-
-						// 2. Draw the round notehead itself on top (Always do this so it stands out sharply in the foreground!)
-						XFillArc(display, pixmap, gc, x_pos, y_pos - (node_h/2), node_w, node_h, 0, 360 * 64);
-								
-						// 3. Ledger lines and sharps (#)
-						if (er_sort_tangent(scan->key)) {
-							XDrawString(display, pixmap, gc, x_pos - 8, y_pos + 4, "#", 1);
-						}
-						if (scan->key == 60 || scan->key == 61) {
-							XSetForeground(display, gc, 0x666666);
-							XDrawLine(display, pixmap, gc, x_pos - 4, y_pos, x_pos + node_w + 4, y_pos);
-						}
-						if ((trin >= 12 || trin <= -14) && trin % 2 == 0) {
-							XSetForeground(display, gc, 0x444444);
-							XDrawLine(display, pixmap, gc, x_pos - 3, y_pos, x_pos + node_w + 3, y_pos);
-						}
-					}
-					
+				// --- DURATION OF THE NOTE (LENGTH OF THE BEAM) ---
+				int node_laengde_pixels = 16; // Standard minimum width (head only)
+				if (g_show_bars && n->end_ms >= 0.0) {
+					node_laengde_pixels = (int)((n->end_ms - n->start_ms) * 0.1); // 1ms = 0.1px
+					if (node_laengde_pixels < node_w) node_laengde_pixels = node_w;
 				}
-				scan = scan->next;
+
+				// Calculate where the bar ends (if g_show_bars is false, x_end is simply equal to the end of the notehead).
+				int x_ende = x_pos + node_laengde_pixels;
+
+				// Draw only if the note or its beam is visible on the playing area.
+				if (x_ende <= play_x_start) continue;
+
+				kanal_batch_t* b = batch_til(display, pixmap, gc, n->channel);
+
+				// 1. The duration bar itself (ONLY if the toggle is ON and it is actually longer than the head).
+				//    Clipped to the window so the coordinates stay within X's 16-bit range.
+				if (g_show_bars && node_laengde_pixels > node_w) {
+					int bx1 = x_pos + (node_w / 2);
+					int bx2 = x_ende;
+					if (bx1 < play_x_start - 10) bx1 = play_x_start - 10;
+					if (bx2 > W + 10) bx2 = W + 10;
+					if (bx2 > bx1) {
+						XRectangle* r = &b->bars[b->n_bars++];
+						r->x = (short)bx1; r->y = (short)(y_pos - 2);
+						r->width = (unsigned short)(bx2 - bx1); r->height = 4;
+					}
+					// A small vertical end line at the end of the beam.
+					if (x_ende < W + 10) {
+						XSegment* e = &b->ends[b->n_ends++];
+						e->x1 = e->x2 = (short)x_ende;
+						e->y1 = (short)(y_pos - 4); e->y2 = (short)(y_pos + 4);
+					}
+				}
+
+				// Head, sharp and ledger lines: skip if hidden behind the legend panel
+				if (x_pos + node_w + 10 < play_x_start) continue;
+
+				// 2. The round notehead itself (drawn after the bars of its channel)
+				XArc* a = &b->heads[b->n_heads++];
+				a->x = (short)x_pos; a->y = (short)(y_pos - (node_h / 2));
+				a->width = (unsigned short)node_w; a->height = (unsigned short)node_h;
+				a->angle1 = 0; a->angle2 = 360 * 64;
+
+				// 3. Sharps (#) and ledger lines
+				if (er_sort_tangent(n->key)) {
+					XPoint* sp = &b->sharps[b->n_sharps++];
+					sp->x = (short)(x_pos - 8); sp->y = (short)(y_pos + 4);
+				}
+				if (n->key == 60 || n->key == 61)
+					tilfoej_ledger(display, pixmap, gc, true, x_pos - 4, x_pos + node_w + 4, y_pos);
+				if ((trin >= 12 || trin <= -14) && trin % 2 == 0)
+					tilfoej_ledger(display, pixmap, gc, false, x_pos - 3, x_pos + node_w + 3, y_pos);
 			}
+
+			// Send the batches: bars, then heads and sharps, then ledger lines
+			tegn_batches(display, pixmap, gc);
 		} else {
             // Hero mode
             XSetForeground(display, gc, 0x1A1A1A);
@@ -970,24 +1128,25 @@ int main(int argc, char *argv[]) {
             XSetForeground(display, gc, 0xFF0000); 
             XDrawLine(display, pixmap, gc, dynamic_center_x, top_h, dynamic_center_x, play_bottom_y);
 
-            tml_message* scan = g_midi;
-            while (scan) {
-                if (scan->type == TML_NOTE_ON && scan->velocity > 0 && g_channels_enabled[scan->channel]) {
-                    int x_pos = dynamic_center_x + (int)((scan->time - graphic_time_ms) * 0.1);
-                    
-                    // Spreads the tones across the entire available height.
-                    float pct = (float)(scan->key - 30) / 60.0f; // assume a range of 60 notes
-                    if (pct < 0.0f) pct = 0.0f;
-                    if (pct > 1.0f) pct = 1.0f;
-                    int y_pos = play_bottom_y - (int)(pct * (play_bottom_y - top_h - 20)) - 10;
+            double venstre_ms = (dynamic_center_x - play_x_start + 40) / 0.1;
+            for (int i = foerste_node_fra(graphic_time_ms - venstre_ms); i < g_node_antal; i++) {
+                const node_t* n = &g_noder[i];
+                int x_pos = dynamic_center_x + (int)((n->start_ms - graphic_time_ms) * 0.1);
+                if (x_pos >= W) break; // all later notes start even further right
+                if (x_pos <= play_x_start || !g_channels_enabled[n->channel]) continue;
 
-                    if (x_pos > play_x_start && x_pos < W && y_pos > top_h && y_pos < play_bottom_y) {
-                        XSetForeground(display, gc, hent_kanal_farve(scan->channel));
-                        XFillRectangle(display, pixmap, gc, x_pos, y_pos - 6, 16, 12);
-                    }
-                }
-                scan = scan->next;
+                // Spreads the tones across the entire available height.
+                float pct = (float)(n->key - 30) / 60.0f; // assume a range of 60 notes
+                if (pct < 0.0f) pct = 0.0f;
+                if (pct > 1.0f) pct = 1.0f;
+                int y_pos = play_bottom_y - (int)(pct * (play_bottom_y - top_h - 20)) - 10;
+                if (y_pos <= top_h || y_pos >= play_bottom_y) continue;
+
+                kanal_batch_t* b = batch_til(display, pixmap, gc, n->channel);
+                XRectangle* r = &b->bars[b->n_bars++];
+                r->x = (short)x_pos; r->y = (short)(y_pos - 6); r->width = 16; r->height = 12;
             }
+            tegn_batches(display, pixmap, gc);
         }
 
         // --- ZONE 3: ADLIB INSTRUMENT LEGEND ---
@@ -1063,7 +1222,9 @@ int main(int argc, char *argv[]) {
                 XDrawString(display, pixmap, gc, 20, H - 20, status_str, strlen(status_str));
 				// Copy the entire dynamic frame to the window				
 				XCopyArea(display, pixmap, window, gc, 0, 0, W, H, 0, 0);
-				XFlush(display);
+				// Wait until the X server has executed this frame, so frames can never
+				// pile up in its queue (and lag behind the sound) on a slow display.
+				XSync(display, False);
 
 				// Sleep until the next frame is due (absolute deadline, so drawing time
 				// does not lower the frame rate). If far behind (e.g. after a file
@@ -1071,7 +1232,7 @@ int main(int argc, char *argv[]) {
 				next_frame_ms += FRAME_TIME_MS;
 				double now_ms = get_monotonic_ms();
 				if (next_frame_ms < now_ms - FRAME_TIME_MS) next_frame_ms = now_ms;
-				if (next_frame_ms > now_ms) usleep((useconds_t)((next_frame_ms - now_ms) * 1000.0));
+				if (next_frame_ms > now_ms) usleep((unsigned int)((next_frame_ms - now_ms) * 1000.0));
     }
 
     // 8. Clean up
@@ -1089,6 +1250,7 @@ int main(int argc, char *argv[]) {
     
     audio_close();
     tml_free(g_midi);
+    free(g_noder);
     tsf_close(g_tsf);
     return 0;
 }

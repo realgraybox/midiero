@@ -34,9 +34,15 @@ TARGET = midiero
 
 CFLAGS += -Os -Wall -Wshadow -Wextra -Wno-deprecated-declarations \
 			--std=gnu99 -ffunction-sections -fdata-sections \
-			-I./audio -I./xfileselect -DAUDIO_HAVE_OSS -DAUDIO_HAVE_TINYALSA -DTHREAD
+			-I./audio -I./xfileselect -DAUDIO_HAVE_OSS -DAUDIO_HAVE_TINYALSA
 			
-LDFLAGS += $(STATIC) -Wl,--gc-sections,--sort-common,-s -lX11 -lm -lpthread
+LDFLAGS += $(STATIC) -Wl,--gc-sections,--sort-common,-s -lX11 -lm
+
+THREAD ?= 0
+ifeq ($(THREAD),1)
+CFLAGS  += -DTHREAD
+LDFLAGS += -lpthread
+endif
 
 .PHONY: all clean install
 

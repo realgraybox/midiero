@@ -45,8 +45,11 @@ all:  $(TARGET)
 bank.h: Nokia_6230i_RM-72_.sf2
 	xxd -i Nokia_6230i_RM-72_.sf2 bank.h
 
-$(TARGET): bank.h $(OBJS) 
-	$(CC) -o $@ $^ $(LDFLAGS) $(CFLAGS) 
+# midiero.c includes the generated bank.h (also correct with make -j)
+midiero.o: bank.h
+
+$(TARGET): $(OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) $(CFLAGS)
 	
 install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)

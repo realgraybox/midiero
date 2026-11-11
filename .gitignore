@@ -1,0 +1,6 @@
+# minidvd build output
+*.o
+*.obj
+midiero
+
+/archive

@@ -101,8 +101,7 @@ static double g_graphic_time = 0.0;
 static double g_graphic_wall_time = 0.0;
 #endif
 
-int g_channel_programs[16] = {0}; // Default preset 0 (Piano) for all channels
-int g_channel_banks[16] = {0};    // Standard bank 0
+int g_channel_preset_index[16] = {0}; // Preset the synth really uses per channel (bank-aware, for the legend)
 bool g_channel_has_played[16] = {false}; // Checking whether the track actually contains music.
 char g_nuvaerende_midi_navn[256] = "No MIDI loaded - Use key [L]";
 char g_nuvaerende_sf2_navn[256]  = "Build in Nokia Bank (Default)";
@@ -162,70 +161,132 @@ static double get_monotonic_ms(void) {
 }
 #endif
 
-// Function to dynamically load/switch a MIDI file
-tml_message* skift_midi_fil(const char* sti, tml_message* gammel_midi, double* afspilnings_tid) {
-    if (gammel_midi) {
-        tml_free(gammel_midi); // Free the old song from RAM
+// Send one MIDI message to the synth (used by both the threaded and the single-threaded build).
+// play_notes = false is used when replaying instrument/controller state onto a new SoundFont.
+// Muting only suppresses note-ons: program, bank, controller and pitch-bend changes are
+// always applied, so an unmuted channel has the right instrument and settings.
+static void send_midi_event(tsf* f, const tml_message* msg, bool play_notes) {
+    switch (msg->type) {
+    case TML_NOTE_ON:
+    case TML_NOTE_OFF:
+    case TML_PROGRAM_CHANGE:
+    case TML_PITCH_BEND:
+    case TML_CONTROL_CHANGE:
+        break;
+    default:
+        return; // meta/sysex messages: their channel field is not initialized by tml
     }
-    
+    if (msg->channel >= 16)
+        return;
+
+    switch (msg->type) {
+    case TML_NOTE_ON:
+        if (!play_notes)
+            break;
+        if (msg->velocity > 0)
+            g_channel_has_played[msg->channel] = true; // The track is now in use!
+        if (g_channels_enabled[msg->channel])
+            tsf_channel_note_on(f, msg->channel, msg->key, msg->velocity / 127.0f);
+        break;
+    case TML_NOTE_OFF:
+        if (play_notes)
+            tsf_channel_note_off(f, msg->channel, msg->key);
+        break;
+    case TML_PROGRAM_CHANGE:
+        tsf_channel_set_presetnumber(f, msg->channel, msg->program, (msg->channel == 9));
+        g_channel_preset_index[msg->channel] = tsf_channel_get_preset_index(f, msg->channel);
+        break;
+    case TML_PITCH_BEND:
+        tsf_channel_set_pitchwheel(f, msg->channel, msg->pitch_bend);
+        break;
+    case TML_CONTROL_CHANGE:
+        // Volume, expression, pan, sustain, bank select (MSB/LSB), RPN pitch-bend range ...
+        tsf_channel_midi_control(f, msg->channel, msg->control, msg->control_value);
+        break;
+    }
+}
+
+// Put all 16 channels back to their power-on state (new song, rewind, new SoundFont).
+static void reset_channels(tsf* f) {
+    tsf_reset(f); // stop all voices
+    for (int i = 0; i < 16; i++) {
+        tsf_channel_midi_control(f, i, 121, 0); // Reset All Controllers (volume, pan, bank, pitch range ...)
+        tsf_channel_set_sustain(f, i, 0);
+        tsf_channel_set_pitchwheel(f, i, 8192);
+        tsf_channel_set_presetnumber(f, i, 0, (i == 9));
+        g_channel_preset_index[i] = tsf_channel_get_preset_index(f, i);
+    }
+}
+
+// Function to load a MIDI file. Returns the new song, or NULL on failure.
+// The caller swaps it in and frees the old song, so a failed load keeps the current song.
+tml_message* skift_midi_fil(const char* sti) {
     tml_message* ny_midi = tml_load_filename(sti);
+    char* rent_navn = strrchr(sti, '/');
+    const char* navn = rent_navn ? rent_navn + 1 : sti;
+
     if (!ny_midi) {
-        snprintf(g_nuvaerende_midi_navn, sizeof(g_nuvaerende_midi_navn), "Error loading!");
+        snprintf(g_nuvaerende_midi_navn, sizeof(g_nuvaerende_midi_navn), "Error loading %s", navn);
         return NULL;
     }
-    
+
     // Save the clean filename without the path to the header.
-    char* rent_navn = strrchr(sti, '/');
-    snprintf(g_nuvaerende_midi_navn, sizeof(g_nuvaerende_midi_navn), "%s", rent_navn ? rent_navn + 1 : sti);
-    
-    *afspilnings_tid = 0.0; // Rewind to the beginning
-    
+    snprintf(g_nuvaerende_midi_navn, sizeof(g_nuvaerende_midi_navn), "%s", navn);
     printf("Successfully loaded MIDI: %s\n", g_nuvaerende_midi_navn);
     return ny_midi;
 }
 
-// Function to dynamically load/switch a SoundFont (.sf2)
-void skift_soundfont(const char* sti, tsf** nuvaerende_tsf) {
-    if (*nuvaerende_tsf) {
-        tsf_close(*nuvaerende_tsf); // Close the old synth bank
-    }
-    
+// Function to dynamically load/switch a SoundFont (.sf2). sti == NULL means the built-in bank.
+// song_start/song_pos: the song and the next message to be played, used to replay the
+// instrument and controller state onto the new bank so it continues seamlessly.
+// The (slow) file loading happens outside the audio lock; only the swap is locked.
+void skift_soundfont(const char* sti, tsf** nuvaerende_tsf, tml_message* song_start, tml_message* song_pos) {
+    tsf* ny_tsf = NULL;
+
     if (sti == NULL) {
-        *nuvaerende_tsf = tsf_load_memory(Nokia_6230i_RM_72__sf2, Nokia_6230i_RM_72__sf2_len);
+        ny_tsf = tsf_load_memory(Nokia_6230i_RM_72__sf2, Nokia_6230i_RM_72__sf2_len);
         snprintf(g_nuvaerende_sf2_navn, sizeof(g_nuvaerende_sf2_navn), "Built-in Nokia Bank (Default)");
     } else {
-        *nuvaerende_tsf = tsf_load_filename(sti);
-        if (!*nuvaerende_tsf) {
-            *nuvaerende_tsf = tsf_load_memory(Nokia_6230i_RM_72__sf2, Nokia_6230i_RM_72__sf2_len);
+        ny_tsf = tsf_load_filename(sti);
+        if (!ny_tsf) {
+            ny_tsf = tsf_load_memory(Nokia_6230i_RM_72__sf2, Nokia_6230i_RM_72__sf2_len);
             snprintf(g_nuvaerende_sf2_navn, sizeof(g_nuvaerende_sf2_navn), "Error! Switched to built-in fallback.");
         } else {
             char* rent_navn = strrchr(sti, '/');
             snprintf(g_nuvaerende_sf2_navn, sizeof(g_nuvaerende_sf2_navn), "%s", rent_navn ? rent_navn + 1 : sti);
         }
     }
-    
-    // Configure the new output format
-    tsf_set_output(*nuvaerende_tsf, TSF_STEREO_INTERLEAVED, SAMPLE_RATE, 0.0f);
-    
-    // --- SYNCHRONIZATION OF THE NEW SOUNDFONT ---
-    // We restore all instruments and controls on the new instance.
-    for (int i = 0; i < 16; i++) {
-        int preset = g_channel_programs[i];
-        
-        // 1. Tell the new TSF instance which bank and preset to use on the channel
-        // If your version does not support bank selectors directly per channel, we simply set the preset:
-        tsf_channel_set_presetnumber(*nuvaerende_tsf, i, preset, (i == 9));
-        
-        // 2. If the channel was muted by the user, we turn off its nodes immediately
-        if (!g_channels_enabled[i]) {
-            tsf_channel_note_off_all(*nuvaerende_tsf, i); 
-        }
+    if (!ny_tsf) {
+        fprintf(stderr, "Could not load any SoundFont\n");
+        return; // keep the current one (if any)
     }
-    
+
+    // Configure the new output format
+    tsf_set_output(ny_tsf, TSF_STEREO_INTERLEAVED, SAMPLE_RATE, 0.0f);
+
+#ifdef THREAD
+    pthread_mutex_lock(&audio_mutex);
+#endif
+    // --- SYNCHRONIZATION OF THE NEW SOUNDFONT ---
+    // Replay every program/bank/controller/pitch-bend message up to the current position.
+    reset_channels(ny_tsf);
+    for (tml_message* m = song_start; m && m != song_pos; m = m->next)
+        send_midi_event(ny_tsf, m, false);
+
+    tsf* gammel_tsf = *nuvaerende_tsf;
+    *nuvaerende_tsf = ny_tsf;
+#ifdef THREAD
+    pthread_mutex_unlock(&audio_mutex);
+#endif
+    if (gammel_tsf)
+        tsf_close(gammel_tsf); // Close the old synth bank (the audio thread no longer uses it)
+
     printf("Active SoundFont reloaded and synchronized: %s\n", g_nuvaerende_sf2_navn);
 }
 
 #ifdef THREAD
+// All shared state (g_time_ms, g_current_msg, g_is_paused, g_graphic_*) is only read
+// and written while holding audio_mutex; only the blocking audio_write() is unlocked.
 static void *audio_thread(void *arg) {
     tsf **tsf_ptr = (tsf **)arg;
 
@@ -236,93 +297,42 @@ static void *audio_thread(void *arg) {
 
         if (!g_is_paused && g_midi) {
             double chunk_time_ms = ((double)BUFFER_SIZE / SAMPLE_RATE) * 1000.0;
-
             double next_time_ms = g_time_ms + chunk_time_ms * g_speed_modifier;
 
+            // Process and handle all MIDI events belonging to this time interval.
             while (g_current_msg && g_current_msg->time <= next_time_ms) {
-
-                tml_message *msg = g_current_msg;
-
-				switch (msg->type) {
-				case TML_NOTE_ON:
-				case TML_NOTE_OFF:
-				case TML_PROGRAM_CHANGE:
-				case TML_PITCH_BEND:
-				case TML_CONTROL_CHANGE:
-					if (msg->channel >= 16)
-						break;
-
-					if (!g_channels_enabled[msg->channel])
-						break;
-
-					switch (msg->type) {
-					case TML_NOTE_ON:
-						if (msg->velocity > 0) {
-							g_channel_has_played[msg->channel] = true;
-						}
-						tsf_channel_note_on(*tsf_ptr, msg->channel, msg->key,
-											msg->velocity / 127.0f);
-						break;
-
-					case TML_NOTE_OFF:
-						tsf_channel_note_off(*tsf_ptr, msg->channel, msg->key);
-						break;
-
-					case TML_PROGRAM_CHANGE:
-						g_channel_programs[msg->channel] = msg->program;
-						tsf_channel_set_presetnumber(*tsf_ptr, msg->channel,
-													 msg->program, msg->channel == 9);
-						break;
-
-					case TML_PITCH_BEND:
-						tsf_channel_set_pitchwheel(*tsf_ptr, msg->channel,
-												   msg->pitch_bend);
-						break;
-
-					case TML_CONTROL_CHANGE:
-						if (msg->control == 0 || msg->control == 32) {
-							g_channel_banks[msg->channel] = msg->control_value;
-						}
-						break;
-					}
-					break;
-				}
-                g_current_msg = msg->next;
+                send_midi_event(*tsf_ptr, g_current_msg, true);
+                g_current_msg = g_current_msg->next;
             }
 
             tsf_render_short(*tsf_ptr, sample_buffer, BUFFER_SIZE, 0);
-
-			pthread_mutex_unlock(&audio_mutex);
-            
-            if (audio_write(sample_buffer, BUFFER_SIZE) < 0) {
-                perror("audio_write");
-                audio_error = 1;
-                running = false;
-                break;
-            }
-
             g_time_ms = next_time_ms;
+
+            // Pause and go back to start
             if (g_current_msg == NULL && tsf_active_voice_count(*tsf_ptr) == 0) {
-				g_time_ms = 0.0;
-				g_is_paused = true;
-				g_current_msg = g_midi;
-				
-				g_graphic_time = 0.0;
-				g_graphic_wall_time = get_monotonic_ms();
-				
-				printf("The song is over. Rewinds to the start and pauses.\n");
-			}
-        } else {
-            pthread_mutex_unlock(&audio_mutex);
+                g_time_ms = 0.0;
+                g_is_paused = true;
+                g_current_msg = g_midi;
+                reset_channels(*tsf_ptr);
 
-            memset(sample_buffer, 0, sizeof(sample_buffer));
+                g_graphic_time = 0.0;
+                g_graphic_wall_time = get_monotonic_ms();
 
-            if (audio_write(sample_buffer, BUFFER_SIZE) < 0) {
-                audio_error = 1;
-                running = false;
-                break;
+                printf("The song is over. Rewinds to the start and pauses.\n");
             }
-            usleep(10000);
+        } else {
+            // Keep the device fed with silence while paused (no underruns)
+            memset(sample_buffer, 0, sizeof(sample_buffer));
+        }
+
+        pthread_mutex_unlock(&audio_mutex);
+
+        // Blocks until the device has room: this paces the thread
+        if (audio_write(sample_buffer, BUFFER_SIZE) < 0) {
+            perror("audio_write");
+            audio_error = 1;
+            running = false;
+            break;
         }
     }
     return NULL;
@@ -354,8 +364,9 @@ int main(int argc, char *argv[]) {
     // 3. Check arguments at startup
     if (argc >= 2) {
         // If there is an argument, we always assume it is a MIDI file
-        g_midi = skift_midi_fil(argv[1], NULL, &g_time_ms);
-       
+        g_midi = skift_midi_fil(argv[1]);
+        g_time_ms = 0.0;
+
 #ifdef THREAD
 		g_current_msg = g_midi;
 #else
@@ -365,9 +376,14 @@ int main(int argc, char *argv[]) {
     
     // If an sf2 file is specified as argument 2, use it; otherwise, use the built-in one.
     if (argc >= 3) {
-        skift_soundfont(argv[2], &g_tsf);
+        skift_soundfont(argv[2], &g_tsf, g_midi, g_midi);
     } else {
-        skift_soundfont(NULL, &g_tsf); // Uses the embedded Nokia bank automatically
+        skift_soundfont(NULL, &g_tsf, g_midi, g_midi); // Uses the embedded Nokia bank automatically
+    }
+    if (!g_tsf) {
+        audio_close();
+        tml_free(g_midi);
+        return 1;
     }
 
     // 5. Initialize X11 Window
@@ -405,8 +421,12 @@ int main(int argc, char *argv[]) {
     XFontStruct* font = XLoadQueryFont(display, "fixed");
     if(font) XSetFont(display, gc, font->fid);
 #ifdef THREAD
-	pthread_create(&audio_tid, NULL, audio_thread, &g_tsf);	
-#endif	
+	bool audio_thread_started = (pthread_create(&audio_tid, NULL, audio_thread, &g_tsf) == 0);
+	if (!audio_thread_started) {
+		fprintf(stderr, "Could not start the audio thread\n");
+		running = false;
+	}
+#endif
     // 6. Main loop
 #ifndef THREAD
 	short sample_buffer[BUFFER_SIZE * 2]; // Stereo buffer
@@ -465,12 +485,13 @@ int main(int argc, char *argv[]) {
 					g_node_mode = !g_node_mode; // Switch between Hero and Node view!
 				}
 				else if (keysym == XK_l || keysym == XK_L) {
-					g_is_paused = true; // Pause while selecting a file
 #ifdef THREAD
 					pthread_mutex_lock(&audio_mutex);
+					g_is_paused = true; // Pause while selecting a file
 					tsf_note_off_all(g_tsf);
 					pthread_mutex_unlock(&audio_mutex);
 #else
+					g_is_paused = true; // Pause while selecting a file
                     tsf_note_off_all(g_tsf);
 #endif
                      midi_path = x11_filechooser(NULL,
@@ -480,37 +501,44 @@ int main(int argc, char *argv[]) {
 						FC_MODE_FILE,	//select mode
 						"[q/Esc]: Cancel [Enter]: Open [Click]: Select");			//help text / footer area
                     if (midi_path) {
-                        // Reset track history for the new song
-                        for(int i=0; i<16; i++) g_channel_has_played[i] = false;
-#ifdef THREAD
-						pthread_mutex_lock(&audio_mutex);
-
-						g_is_paused = true;
-						tsf_note_off_all(g_tsf);
-						g_midi = skift_midi_fil(midi_path, g_midi, &g_time_ms);
-						g_current_msg = g_midi;
-
-						g_time_ms = 0.0;
-						g_graphic_time = 0.0;
-						g_graphic_wall_time = get_monotonic_ms();
-
-						pthread_mutex_unlock(&audio_mutex);
-#else
-						g_midi = skift_midi_fil(midi_path, g_midi, &g_time_ms);
-                        current_msg = g_midi;
-#endif
+                        // Load outside the lock; on failure the current song is kept
+                        tml_message* ny_midi = skift_midi_fil(midi_path);
                         free(midi_path);
+
+                        if (ny_midi) {
+                            tml_message* gammel_midi = g_midi;
+#ifdef THREAD
+							pthread_mutex_lock(&audio_mutex);
+#endif
+							g_is_paused = true;
+							reset_channels(g_tsf);
+							for (int i = 0; i < 16; i++) g_channel_has_played[i] = false; // Reset track history
+							g_midi = ny_midi;
+#ifdef THREAD
+							g_current_msg = g_midi;
+							g_graphic_time = 0.0;
+							g_graphic_wall_time = get_monotonic_ms();
+#else
+							current_msg = g_midi;
+#endif
+							g_time_ms = 0.0; // Rewind to the beginning
+#ifdef THREAD
+							pthread_mutex_unlock(&audio_mutex);
+#endif
+							tml_free(gammel_midi); // the audio thread no longer references it
+                        }
                     }
 				}
 				else if (keysym == XK_f || keysym == XK_F) {
-                    g_is_paused = true;
 #ifdef THREAD
 					pthread_mutex_lock(&audio_mutex);
+					g_is_paused = true;
 					tsf_note_off_all(g_tsf);
 					pthread_mutex_unlock(&audio_mutex);
 #else
+                    g_is_paused = true;
                     tsf_note_off_all(g_tsf);
-#endif                    
+#endif                   
                     soundfont_path = x11_filechooser(NULL, 
 						"Midiero - The Interactive MIDI player",
 						"Select a SoundFont .sf2",
@@ -521,12 +549,12 @@ int main(int argc, char *argv[]) {
                     // If the user selects a file, it is loaded. If cancelled (NULL),
                     // we can either keep the current one or force the built-in one.
                     if (soundfont_path) {
+                        // skift_soundfont() takes the audio lock itself, only for the swap.
+                        // Safe to read g_current_msg here: the song is paused.
 #ifdef THREAD
-						pthread_mutex_lock(&audio_mutex);
-						skift_soundfont(soundfont_path, &g_tsf);
-						pthread_mutex_unlock(&audio_mutex);
+                        skift_soundfont(soundfont_path, &g_tsf, g_midi, g_current_msg);
 #else
-                        skift_soundfont(soundfont_path, &g_tsf);
+                        skift_soundfont(soundfont_path, &g_tsf, g_midi, current_msg);
 #endif
                         free(soundfont_path);
                     }
@@ -588,73 +616,44 @@ int main(int argc, char *argv[]) {
 		
 		pthread_mutex_unlock(&audio_mutex);	
   
-#else //THREADS  
+#else //THREADS
         // Pause and go back to start
         if (g_midi != NULL && current_msg == NULL && tsf_active_voice_count(g_tsf) == 0) {
             g_time_ms = 0.0;               // Reset the time
             g_is_paused = true;            // Pause
             current_msg = g_midi;          // Rewind MIDI to the start
-			tsf_note_off_all(g_tsf); //above unsafe
+            reset_channels(g_tsf);         // Instruments/controllers back to the song's start state
 
             printf("The song is over. Rewinds to the start and pauses.\n");
         }
-   
-		// How many milliseconds does a fixed audio chunk of 512 samples correspond to?
-        // Formula: (samples / SAMPLE_RATE) * 1000 ms
+
+        // How many milliseconds does a fixed audio chunk of BUFFER_SIZE frames correspond to?
+        // Formula: (frames / SAMPLE_RATE) * 1000 ms
         double chunk_time_ms = ((double)BUFFER_SIZE / SAMPLE_RATE) * 1000.0;
 
-        if (!g_is_paused) {
-			 // Advance the time based on the fixed audio chunk and the speed.
+        if (!g_is_paused && g_midi) {
+            // Advance the time based on the fixed audio chunk and the speed.
             double next_time_ms = g_time_ms + (chunk_time_ms * g_speed_modifier);
 
             // Process and handle all MIDI events belonging to this time interval.
             while (current_msg && current_msg->time <= next_time_ms) {
-                // TSF must only play the audio if the channel is active.
-                if (g_channels_enabled[current_msg->channel]) {
-                    switch (current_msg->type) {
-                        case TML_NOTE_ON: {
-							if (current_msg->velocity > 0) {
-								g_channel_has_played[current_msg->channel] = true; // The track is now in use!
-							}
-							tsf_channel_note_on(g_tsf, current_msg->channel, current_msg->key, current_msg->velocity / 127.0f);
-                            break;
-						}
-                        case TML_NOTE_OFF:
-                            tsf_channel_note_off(g_tsf, current_msg->channel, current_msg->key);
-                            break;
-                        case TML_PROGRAM_CHANGE:
-							// Save the selected instrument (program) for this channel.
-							g_channel_programs[current_msg->channel] = current_msg->program;
-							tsf_channel_set_presetnumber(g_tsf, current_msg->channel, current_msg->program, (current_msg->channel == 9));
-                            break;
-                        case TML_PITCH_BEND:
-                            tsf_channel_set_pitchwheel(g_tsf, current_msg->channel, current_msg->pitch_bend);
-                            break;
-                        case TML_CONTROL_CHANGE:
-							// Many MIDI files switch banks via Control Change 0 (Bank Select MSB) or 32 (LSB).
-							if (current_msg->control == 0 || current_msg->control == 32) {
-								g_channel_banks[current_msg->channel] = current_msg->control_value;
-							}
-                            break;
-                    }
-                }
+                send_midi_event(g_tsf, current_msg, true);
                 current_msg = current_msg->next;
             }
 
-            // TSF automatically stretches/compresses the audio internally when we change g_time_ms 
+            // TSF automatically stretches/compresses the audio internally when we change g_time_ms
             // relative to the MIDI events being triggered.
             tsf_render_short(g_tsf, sample_buffer, BUFFER_SIZE, 0);
-            
-            if (audio_write(sample_buffer, BUFFER_SIZE) < 0) {
-                perror("audio_write");
-                running = false;
-            }
-
             g_time_ms = next_time_ms;
-
         } else {
-            // We sleep briefly during the pause to avoid consuming 100% CPU in an empty loop.
-            usleep(10000);
+            // Paused: keep the device fed with silence. This avoids underruns and the
+            // blocking write paces the loop exactly like during playback.
+            memset(sample_buffer, 0, sizeof(sample_buffer));
+        }
+
+        if (audio_write(sample_buffer, BUFFER_SIZE) < 0) {
+            perror("audio_write");
+            running = false;
         }
 #endif	//THREAD
 		// =========================================================================
@@ -697,7 +696,7 @@ int main(int argc, char *argv[]) {
         XSetForeground(display, gc, 0x222222); 
         XFillRectangle(display, pixmap, gc, 0, 0, W, top_h);
         XSetForeground(display, gc, WhitePixel(display, screen));
-        char header_str[256];
+        char header_str[600]; // room for both 256-char names
 
 		snprintf(header_str, sizeof(header_str), "  Midiero :: File: %s :: Bank: %s :: Resolution: %dx%d", g_nuvaerende_midi_navn, g_nuvaerende_sf2_navn, W, H);
         
@@ -813,6 +812,7 @@ int main(int argc, char *argv[]) {
             // Hero mode
             XSetForeground(display, gc, 0x1A1A1A);
             int grid_step = (play_bottom_y - top_h) / 15;
+            if (grid_step < 1) grid_step = 1; // window very small: avoid an endless loop
             for (int i = top_h + grid_step; i < play_bottom_y; i += grid_step) {
                 XDrawLine(display, pixmap, gc, play_x_start, i, W, i);
             }
@@ -831,7 +831,8 @@ int main(int argc, char *argv[]) {
                     
                     // Spreads the tones across the entire available height.
                     float pct = (float)(scan->key - 30) / 60.0f; // assume a range of 60 notes
-                    if (pct < 0.0f) pct = 0.0f; if (pct > 1.0f) pct = 1.0f;
+                    if (pct < 0.0f) pct = 0.0f;
+                    if (pct > 1.0f) pct = 1.0f;
                     int y_pos = play_bottom_y - (int)(pct * (play_bottom_y - top_h - 20)) - 10;
 
                     if (x_pos > play_x_start && x_pos < W && y_pos > top_h && y_pos < play_bottom_y) {
@@ -874,9 +875,9 @@ int main(int argc, char *argv[]) {
             else if (!g_channels_enabled[i]) {
                 XSetForeground(display, gc, 0x442222); 
                 XFillRectangle(display, pixmap, gc, 15, y_offset - 8, 10, 8);
-                const char* preset_name = tsf_bank_get_presetname(g_tsf, g_channel_banks[i], g_channel_programs[i]);
-                if (!preset_name) preset_name = "Acoustic Grand Piano";
-                if (i == 9) preset_name = "Standard Drum Kit";
+                // Name of the preset the synth really uses on this channel (bank-aware)
+                const char* preset_name = tsf_get_presetname(g_tsf, g_channel_preset_index[i]);
+                if (!preset_name) preset_name = (i == 9) ? "Standard Drum Kit" : "Acoustic Grand Piano";
                 XSetForeground(display, gc, 0x777777); 
                 snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: [MUTED] %.10s", key_hint, i + 1, preset_name);
                 XDrawString(display, pixmap, gc, 35, y_offset, legend_item, strlen(legend_item));
@@ -885,11 +886,9 @@ int main(int argc, char *argv[]) {
                 XSetForeground(display, gc, hent_kanal_farve(i));
                 XFillRectangle(display, pixmap, gc, 15, y_offset - 8, 10, 8);
                 
-                const char* preset_name = tsf_bank_get_presetname(g_tsf, g_channel_banks[i], g_channel_programs[i]);
-                
-                if (!preset_name) preset_name = "Acoustic Grand Piano";
-                
-                if (i == 9) preset_name = "Standard Drum Kit";
+                // Name of the preset the synth really uses on this channel (bank-aware)
+                const char* preset_name = tsf_get_presetname(g_tsf, g_channel_preset_index[i]);
+                if (!preset_name) preset_name = (i == 9) ? "Standard Drum Kit" : "Acoustic Grand Piano";
                 
                 XSetForeground(display, gc, WhitePixel(display, screen)); 
                 snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: %.16s", key_hint, i + 1, preset_name);
@@ -929,9 +928,11 @@ int main(int argc, char *argv[]) {
     // 8. Clean up
 #ifdef THREAD
     running = false;
-	pthread_join(audio_tid, NULL);
-#endif    
-    
+	if (audio_thread_started) pthread_join(audio_tid, NULL);
+	if (audio_error) fprintf(stderr, "Audio output stopped because of an error.\n");
+#endif
+
+    if (font) XFreeFont(display, font);
     XFreePixmap(display, pixmap);
     XFreeGC(display, gc);
     XDestroyWindow(display, window);

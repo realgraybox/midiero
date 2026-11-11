@@ -34,7 +34,7 @@ TARGET = midiero
 
 CFLAGS += -Os -Wall -Wshadow -Wextra -Wno-deprecated-declarations \
 			--std=gnu99 -ffunction-sections -fdata-sections \
-			-I./audio -I./xfileselect -DAUDIO_HAVE_OSS -DAUDIO_HAVE_TINYALSA  -DTHREAD
+			-I./audio -I./xfileselect -DAUDIO_HAVE_OSS -DAUDIO_HAVE_TINYALSA -DTHREAD
 			
 LDFLAGS += $(STATIC) -Wl,--gc-sections,--sort-common,-s -lX11 -lm -lpthread
 
@@ -48,7 +48,7 @@ bank.h: Nokia_6230i_RM-72_.sf2
 $(TARGET): bank.h $(OBJS) 
 	$(CC) -o $@ $^ $(LDFLAGS) $(CFLAGS) 
 	
-install: $(TARGET2)
+install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/
 

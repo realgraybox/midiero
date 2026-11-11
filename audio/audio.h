@@ -40,6 +40,12 @@ enum audio_backend {
 int  audio_init(int rate, int channels);
 int  audio_init_backend(enum audio_backend backend, int rate, int channels);
 int  audio_write(const int16_t *pcm, int samples);
+
+/*
+ * Frames written but not yet played (the output delay right now), or -1 if
+ * the backend cannot tell. Coarse on many drivers (updated per fragment).
+ */
+int  audio_queued_frames(void);
 void audio_close(void);
 
 enum audio_backend audio_get_backend(void);

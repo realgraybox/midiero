@@ -57,11 +57,20 @@
 //end xfileselect area
 
 #define SAMPLE_RATE		48000		//48000 more universal than 44100
-#define BUFFER_SIZE		2048		//2048 needed for large resolution when non-threaded
+#define BUFFER_SIZE		2048		//threaded build: frames rendered per audio_write (the thread blocks on it)
 #define WINDOW_WIDTH	800
 #define WINDOW_HEIGHT	600
-#define TARGET_FPS		80
-#define FRAME_TIME_US (1000000 / TARGET_FPS)
+#define TARGET_FPS		60			//smoothest when equal to the monitor refresh rate
+#define FRAME_TIME_MS	(1000.0 / TARGET_FPS)
+
+#ifndef THREAD
+// Single-threaded build: audio is rendered in small chunks, and only when the device
+// has room, so the loop never waits for the sound card. TARGET_QUEUE_MS is how much
+// audio is kept queued = how long one frame may take before the sound runs dry.
+#define CHUNK_FRAMES		256		//~5.3 ms at 48 kHz
+#define TARGET_QUEUE_MS		70
+#define TARGET_QUEUE_FRAMES	(SAMPLE_RATE * TARGET_QUEUE_MS / 1000)
+#endif
 
 #if defined(__UCLIBC__)
 #include <math.h>
@@ -96,10 +105,6 @@ double g_speed_modifier = 1.0;
 bool g_is_paused = false;
 bool g_channels_enabled[16];
 
-#ifdef THREAD
-static double g_graphic_time = 0.0;
-static double g_graphic_wall_time = 0.0;
-#endif
 
 int g_channel_preset_index[16] = {0}; // Preset the synth really uses per channel (bank-aware, for the legend)
 bool g_channel_has_played[16] = {false}; // Checking whether the track actually contains music.
@@ -153,13 +158,158 @@ double get_time_in_ms() {
     return (tv.tv_sec * 1000.0) + (tv.tv_usec / 1000.0);
 }
 
-#ifdef THREAD
 static double get_monotonic_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 }
-#endif
+
+// =========================================================================
+// PLAYBACK CLOCK (shared by the threaded and the single-threaded build)
+// =========================================================================
+// The audio side records, for every chunk written to the device, which part of the
+// song it contains (the "timeline"), and samples how much audio is still queued in
+// the device. The graphics side runs a smooth clock counted in device frames that
+// follows the real playback position, and looks up the song time of the frame being
+// heard right now. This compensates the output delay of the sound card exactly, and
+// handles pauses (silence chunks) and speed changes chunk by chunk.
+//
+// The device's "queued" report is often coarse (updated per fragment/period). Such a
+// report can only claim MORE is queued than really is, so the clock follows the most
+// advanced report seen (slowly forgetting it, to track clock drift), never the average.
+// It glides towards that by at most +/-2 % speed, and only jumps when more than 100 ms
+// off (start, underrun).
+//
+// Threaded build: call clock_audio_written(), clock_song_time() and
+// clock_set_song_time() with audio_mutex held.
+
+#define TIMELINE_SIZE		512					//chunks remembered (>= device buffer / chunk size)
+#define CLOCK_SNAP_FRAMES	(SAMPLE_RATE / 10)	//more than 100 ms off: jump
+#define CLOCK_MAX_ADJUST	0.02				//glide by at most +/-2 % speed ...
+#define CLOCK_ADJUST_SPAN	(SAMPLE_RATE / 100)	//... reached at 10 ms error
+#define CLOCK_FORGET		0.05				//frames/ms the best report is forgotten (~1 ms per s)
+
+typedef struct {
+    long long frame_start, frame_end;	//position in the stream of all frames ever written
+    double song_start, song_end;		//song time (ms) at the start/end of the chunk
+} tl_chunk;
+
+static tl_chunk g_tl[TIMELINE_SIZE];
+static int g_tl_head = 0;				//next slot to write
+static int g_tl_count = 0;
+static double g_tl_base = 0.0;			//song time before anything has been written
+static long long g_frames_written = 0;
+
+static bool g_meas_valid = false;
+static double g_meas_offset = 0.0;		//playing frame minus wall time in frames (from the driver)
+static double g_meas_wall = 0.0;
+
+static bool g_clk_valid = false;
+static bool g_clk_stalled = false;		//reached the end of the written audio (underrun)
+static double g_clk_frame = 0.0;		//smoothed playing position, in frames
+static double g_clk_wall = 0.0;
+
+// Frames queued in the device. If the driver cannot tell, it is estimated by
+// assuming the device plays SAMPLE_RATE frames per second.
+// Only called from the audio side (audio thread / single-threaded loop).
+static int playback_queued_frames(void) {
+    static double est_played = 0.0, est_wall = 0.0;
+    int q = audio_queued_frames();
+    if (q >= 0) return q;
+
+    double now = get_monotonic_ms();
+    if (est_wall != 0.0) est_played += (now - est_wall) * SAMPLE_RATE / 1000.0; //first call: playback starts now
+    est_wall = now;
+    if (est_played > (double)g_frames_written) est_played = (double)g_frames_written; //underrun
+    return (int)(g_frames_written - (long long)est_played);
+}
+
+// Audio side: a chunk of 'frames' frames covering song time song_start..song_end
+// (equal while paused) has just been written to the device.
+static void clock_audio_written(int frames, double song_start, double song_end) {
+    tl_chunk* c = &g_tl[g_tl_head];
+    c->frame_start = g_frames_written;
+    g_frames_written += frames;
+    c->frame_end = g_frames_written;
+    c->song_start = song_start;
+    c->song_end = song_end;
+    g_tl_head = (g_tl_head + 1) % TIMELINE_SIZE;
+    if (g_tl_count < TIMELINE_SIZE) g_tl_count++;
+
+    double now = get_monotonic_ms();
+    double offset = (double)(g_frames_written - playback_queued_frames()) - now * SAMPLE_RATE / 1000.0;
+    if (!g_meas_valid || offset < g_meas_offset - CLOCK_SNAP_FRAMES) {
+        g_meas_offset = offset; // first report, or the device fell behind (underrun)
+    } else {
+        double forgotten = g_meas_offset - (now - g_meas_wall) * CLOCK_FORGET;
+        g_meas_offset = offset > forgotten ? offset : forgotten; // most advanced report
+    }
+    g_meas_wall = now;
+    g_meas_valid = true;
+}
+
+// New song loaded: the audio still queued (silence, we are paused) now belongs to it.
+static void clock_set_song_time(double song_ms) {
+    for (int i = 0; i < g_tl_count; i++) {
+        g_tl[i].song_start = song_ms;
+        g_tl[i].song_end = song_ms;
+    }
+    g_tl_base = song_ms;
+}
+
+// Song time of a stream position, interpolated within its chunk.
+static double timeline_lookup(double frame) {
+    const tl_chunk* oldest = NULL;
+    for (int i = 0; i < g_tl_count; i++) {
+        const tl_chunk* c = &g_tl[(g_tl_head - 1 - i + TIMELINE_SIZE) % TIMELINE_SIZE];
+        if (frame >= (double)c->frame_start) {
+            double len = (double)(c->frame_end - c->frame_start);
+            double frac = len > 0.0 ? (frame - (double)c->frame_start) / len : 0.0;
+            if (frac > 1.0) frac = 1.0;
+            return c->song_start + (c->song_end - c->song_start) * frac;
+        }
+        oldest = c;
+    }
+    return oldest ? oldest->song_start : g_tl_base;
+}
+
+// Graphics side, once per frame: song time (ms) of the sound being heard right now.
+static double clock_song_time(void) {
+    if (!g_meas_valid) return g_tl_base;
+
+    double now = get_monotonic_ms();
+    double target = g_meas_offset + now * SAMPLE_RATE / 1000.0;
+    if (target > (double)g_frames_written) target = (double)g_frames_written; //cannot play unwritten audio
+
+    if (!g_clk_valid) {
+        g_clk_frame = target;
+        g_clk_valid = true;
+    } else if (g_clk_stalled) {
+        // Wait at the end of the audio until the device really plays again, then follow it
+        if (target > g_clk_frame) {
+            g_clk_frame = target;
+            g_clk_stalled = false;
+        }
+    } else {
+        double advance = (now - g_clk_wall) * SAMPLE_RATE / 1000.0;
+        double err = target - (g_clk_frame + advance);
+        if (err > CLOCK_SNAP_FRAMES || err < -CLOCK_SNAP_FRAMES) {
+            g_clk_frame = target;
+        } else {
+            double adjust = err / CLOCK_ADJUST_SPAN * CLOCK_MAX_ADJUST;
+            if (adjust > CLOCK_MAX_ADJUST) adjust = CLOCK_MAX_ADJUST;
+            if (adjust < -CLOCK_MAX_ADJUST) adjust = -CLOCK_MAX_ADJUST;
+            g_clk_frame += advance * (1.0 + adjust); //always forward
+        }
+    }
+    if (g_clk_frame >= (double)g_frames_written) {
+        g_clk_frame = (double)g_frames_written;
+        g_clk_stalled = true;
+    }
+    g_clk_wall = now;
+
+    return timeline_lookup(g_clk_frame);
+}
 
 // Send one MIDI message to the synth (used by both the threaded and the single-threaded build).
 // play_notes = false is used when replaying instrument/controller state onto a new SoundFont.
@@ -285,8 +435,8 @@ void skift_soundfont(const char* sti, tsf** nuvaerende_tsf, tml_message* song_st
 }
 
 #ifdef THREAD
-// All shared state (g_time_ms, g_current_msg, g_is_paused, g_graphic_*) is only read
-// and written while holding audio_mutex; only the blocking audio_write() is unlocked.
+// All shared state (g_time_ms, g_current_msg, g_is_paused, the playback clock) is only
+// read and written while holding audio_mutex; only the blocking audio_write() is unlocked.
 static void *audio_thread(void *arg) {
     tsf **tsf_ptr = (tsf **)arg;
 
@@ -294,6 +444,9 @@ static void *audio_thread(void *arg) {
 
     while (running) {
         pthread_mutex_lock(&audio_mutex);
+
+        double chunk_song_start = g_time_ms; //song time covered by this chunk (for the clock)
+        double chunk_song_end = g_time_ms;
 
         if (!g_is_paused && g_midi) {
             double chunk_time_ms = ((double)BUFFER_SIZE / SAMPLE_RATE) * 1000.0;
@@ -307,6 +460,7 @@ static void *audio_thread(void *arg) {
 
             tsf_render_short(*tsf_ptr, sample_buffer, BUFFER_SIZE, 0);
             g_time_ms = next_time_ms;
+            chunk_song_end = next_time_ms;
 
             // Pause and go back to start
             if (g_current_msg == NULL && tsf_active_voice_count(*tsf_ptr) == 0) {
@@ -314,9 +468,6 @@ static void *audio_thread(void *arg) {
                 g_is_paused = true;
                 g_current_msg = g_midi;
                 reset_channels(*tsf_ptr);
-
-                g_graphic_time = 0.0;
-                g_graphic_wall_time = get_monotonic_ms();
 
                 printf("The song is over. Rewinds to the start and pauses.\n");
             }
@@ -334,6 +485,10 @@ static void *audio_thread(void *arg) {
             running = false;
             break;
         }
+
+        pthread_mutex_lock(&audio_mutex);
+        clock_audio_written(BUFFER_SIZE, chunk_song_start, chunk_song_end);
+        pthread_mutex_unlock(&audio_mutex);
     }
     return NULL;
 }
@@ -429,9 +584,10 @@ int main(int argc, char *argv[]) {
 #endif
     // 6. Main loop
 #ifndef THREAD
-	short sample_buffer[BUFFER_SIZE * 2]; // Stereo buffer
+	short sample_buffer[CHUNK_FRAMES * 2]; // Stereo buffer
 	bool running = true;
 #endif
+	double next_frame_ms = get_monotonic_ms();
     while (running) {
         int target_channel = -1;
         while (XPending(display)) {
@@ -452,8 +608,6 @@ int main(int argc, char *argv[]) {
 					pthread_mutex_lock(&audio_mutex);
 					
                     g_is_paused = !g_is_paused;
-                    g_graphic_wall_time = get_monotonic_ms();
-                    
                     pthread_mutex_unlock(&audio_mutex);
 #else
 					g_is_paused = !g_is_paused;
@@ -516,12 +670,11 @@ int main(int argc, char *argv[]) {
 							g_midi = ny_midi;
 #ifdef THREAD
 							g_current_msg = g_midi;
-							g_graphic_time = 0.0;
-							g_graphic_wall_time = get_monotonic_ms();
 #else
 							current_msg = g_midi;
 #endif
 							g_time_ms = 0.0; // Rewind to the beginning
+							clock_set_song_time(0.0); // audio still queued belongs to the new song
 #ifdef THREAD
 							pthread_mutex_unlock(&audio_mutex);
 #endif
@@ -599,63 +752,64 @@ int main(int argc, char *argv[]) {
 #endif                
             }
         }
-#ifdef THREAD
-		double now = get_monotonic_ms();
+#ifndef THREAD
+        // --- AUDIO: top the device up to TARGET_QUEUE_MS in small chunks ---
+        // Only writes while there is room, so the loop does not wait for the sound card
+        // and can draw at TARGET_FPS.
+        double chunk_time_ms = ((double)CHUNK_FRAMES / SAMPLE_RATE) * 1000.0;
+        for (int n = 0; running && n < TARGET_QUEUE_FRAMES / CHUNK_FRAMES + 4; n++) {
+            if (playback_queued_frames() >= TARGET_QUEUE_FRAMES) break;
 
-		pthread_mutex_lock(&audio_mutex);
+            // Pause and go back to start
+            if (g_midi != NULL && current_msg == NULL && tsf_active_voice_count(g_tsf) == 0) {
+                g_time_ms = 0.0;               // Reset the time
+                g_is_paused = true;            // Pause
+                current_msg = g_midi;          // Rewind MIDI to the start
+                reset_channels(g_tsf);         // Instruments/controllers back to the song's start state
 
-		double graphic_time_ms = g_graphic_time;
-
-		if (!g_is_paused && g_graphic_wall_time > 0.0) {
-			graphic_time_ms +=
-				(now - g_graphic_wall_time) * g_speed_modifier;
-		}
-
-		g_graphic_time = graphic_time_ms;
-		g_graphic_wall_time = now;	
-		
-		pthread_mutex_unlock(&audio_mutex);	
-  
-#else //THREADS
-        // Pause and go back to start
-        if (g_midi != NULL && current_msg == NULL && tsf_active_voice_count(g_tsf) == 0) {
-            g_time_ms = 0.0;               // Reset the time
-            g_is_paused = true;            // Pause
-            current_msg = g_midi;          // Rewind MIDI to the start
-            reset_channels(g_tsf);         // Instruments/controllers back to the song's start state
-
-            printf("The song is over. Rewinds to the start and pauses.\n");
-        }
-
-        // How many milliseconds does a fixed audio chunk of BUFFER_SIZE frames correspond to?
-        // Formula: (frames / SAMPLE_RATE) * 1000 ms
-        double chunk_time_ms = ((double)BUFFER_SIZE / SAMPLE_RATE) * 1000.0;
-
-        if (!g_is_paused && g_midi) {
-            // Advance the time based on the fixed audio chunk and the speed.
-            double next_time_ms = g_time_ms + (chunk_time_ms * g_speed_modifier);
-
-            // Process and handle all MIDI events belonging to this time interval.
-            while (current_msg && current_msg->time <= next_time_ms) {
-                send_midi_event(g_tsf, current_msg, true);
-                current_msg = current_msg->next;
+                printf("The song is over. Rewinds to the start and pauses.\n");
             }
 
-            // TSF automatically stretches/compresses the audio internally when we change g_time_ms
-            // relative to the MIDI events being triggered.
-            tsf_render_short(g_tsf, sample_buffer, BUFFER_SIZE, 0);
-            g_time_ms = next_time_ms;
-        } else {
-            // Paused: keep the device fed with silence. This avoids underruns and the
-            // blocking write paces the loop exactly like during playback.
-            memset(sample_buffer, 0, sizeof(sample_buffer));
-        }
+            double chunk_song_start = g_time_ms;
+            if (!g_is_paused && g_midi) {
+                // Advance the time based on the fixed audio chunk and the speed.
+                double next_time_ms = g_time_ms + (chunk_time_ms * g_speed_modifier);
 
-        if (audio_write(sample_buffer, BUFFER_SIZE) < 0) {
-            perror("audio_write");
-            running = false;
+                // Process and handle all MIDI events belonging to this time interval.
+                while (current_msg && current_msg->time <= next_time_ms) {
+                    send_midi_event(g_tsf, current_msg, true);
+                    current_msg = current_msg->next;
+                }
+
+                tsf_render_short(g_tsf, sample_buffer, CHUNK_FRAMES, 0);
+                g_time_ms = next_time_ms;
+            } else {
+                // Paused: keep the device fed with silence (no underruns)
+                memset(sample_buffer, 0, sizeof(sample_buffer));
+            }
+
+            double write_start_ms = get_monotonic_ms();
+            if (audio_write(sample_buffer, CHUNK_FRAMES) < 0) {
+                perror("audio_write");
+                running = false;
+                break;
+            }
+            clock_audio_written(CHUNK_FRAMES, chunk_song_start, g_time_ms);
+
+            // The write had to wait: the device buffer is smaller than TARGET_QUEUE_MS
+            // (or the driver under-reports its delay). Stop here so drawing is not held up.
+            if (get_monotonic_ms() - write_start_ms > chunk_time_ms * 0.5) break;
         }
-#endif	//THREAD
+#endif
+
+        // --- Song time of the sound being heard right now (both builds) ---
+#ifdef THREAD
+        pthread_mutex_lock(&audio_mutex);
+#endif
+        double graphic_time_ms = clock_song_time();
+#ifdef THREAD
+        pthread_mutex_unlock(&audio_mutex);
+#endif
 		// =========================================================================
         // 7. FULLY DYNAMIC & SCALABLE GRAPHICS (Xlib resizing supported)
         // =========================================================================
@@ -740,11 +894,7 @@ int main(int argc, char *argv[]) {
 			tml_message* scan = g_midi;
             while (scan) {
                 if (scan->type == TML_NOTE_ON && scan->velocity > 0 && g_channels_enabled[scan->channel]) {		
-#ifdef THREAD
-					int x_pos = dynamic_center_x + (int)((scan->time - graphic_time_ms) *  0.1 /*/ g_speed_modifier*/);
-#else
-                    int x_pos = dynamic_center_x + (int)((scan->time - g_time_ms) * 0.1);
-#endif
+                    int x_pos = dynamic_center_x + (int)((scan->time - graphic_time_ms) * 0.1);
                     int trin = hent_node_trin(scan->key);
                     int y_pos = center_y - (trin * linje_afstand / 2);
 
@@ -823,11 +973,7 @@ int main(int argc, char *argv[]) {
             tml_message* scan = g_midi;
             while (scan) {
                 if (scan->type == TML_NOTE_ON && scan->velocity > 0 && g_channels_enabled[scan->channel]) {
- #ifdef THREAD
-					int x_pos = dynamic_center_x + (int)((scan->time - graphic_time_ms) * 0.1 /*/ g_speed_modifier*/);
- #else                  
-                    int x_pos = dynamic_center_x + (int)((scan->time - g_time_ms) * 0.1);
-#endif
+                    int x_pos = dynamic_center_x + (int)((scan->time - graphic_time_ms) * 0.1);
                     
                     // Spreads the tones across the entire available height.
                     float pct = (float)(scan->key - 30) / 60.0f; // assume a range of 60 notes
@@ -912,17 +1058,20 @@ int main(int argc, char *argv[]) {
 				if (!g_midi) {
 					snprintf(status_str, sizeof(status_str), "STATUS: READY  |  Press [L] to load a MIDI file to start!");
 				} else {
-#ifdef THREAD
 					snprintf(status_str, sizeof(status_str), "STATUS: %s  |  PLAYBACK TIME: %.2f s", g_is_paused ? "PAUSE  " : "PLAYING", graphic_time_ms / 1000.0);
-#else
-					snprintf(status_str, sizeof(status_str), "STATUS: %s  |  PLAYBACK TIME: %.2f s", g_is_paused ? "PAUSE  " : "PLAYING", g_time_ms / 1000.0);
-#endif
 				}
                 XDrawString(display, pixmap, gc, 20, H - 20, status_str, strlen(status_str));
 				// Copy the entire dynamic frame to the window				
 				XCopyArea(display, pixmap, window, gc, 0, 0, W, H, 0, 0);
 				XFlush(display);
-				usleep(FRAME_TIME_US);
+
+				// Sleep until the next frame is due (absolute deadline, so drawing time
+				// does not lower the frame rate). If far behind (e.g. after a file
+				// dialog) start counting again from now instead of racing to catch up.
+				next_frame_ms += FRAME_TIME_MS;
+				double now_ms = get_monotonic_ms();
+				if (next_frame_ms < now_ms - FRAME_TIME_MS) next_frame_ms = now_ms;
+				if (next_frame_ms > now_ms) usleep((useconds_t)((next_frame_ms - now_ms) * 1000.0));
     }
 
     // 8. Clean up

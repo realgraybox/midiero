@@ -57,12 +57,14 @@ static struct pcm *tiny_pcm;
 #ifdef AUDIO_HAVE_OSS
 static int audio_init_oss(int rate, int channels);
 static int audio_write_oss(const int16_t *pcm, int frames);
+static int audio_queued_oss(void);
 static void audio_close_oss(void);
 #endif
 
 #ifdef AUDIO_HAVE_TINYALSA
 static int audio_init_tinyalsa(int rate, int channels);
 static int audio_write_tinyalsa(const int16_t *pcm, int frames);
+static int audio_queued_tinyalsa(void);
 static void audio_close_tinyalsa(void);
 #endif
 
@@ -119,6 +121,21 @@ int audio_write(const int16_t *pcm, int frames) {
 #ifdef AUDIO_HAVE_TINYALSA
     case AUDIO_BACKEND_TINYALSA:
         return audio_write_tinyalsa(pcm, frames);
+#endif
+    default:
+        return -1;
+    }
+}
+
+int audio_queued_frames(void) {
+    switch (current_backend) {
+#ifdef AUDIO_HAVE_OSS
+    case AUDIO_BACKEND_OSS:
+        return audio_queued_oss();
+#endif
+#ifdef AUDIO_HAVE_TINYALSA
+    case AUDIO_BACKEND_TINYALSA:
+        return audio_queued_tinyalsa();
 #endif
     default:
         return -1;
@@ -240,6 +257,20 @@ static int audio_write_oss(const int16_t *pcm, int frames) {
     return write_all(oss_fd, pcm, bytes);
 }
 
+/* Frames written but not yet played, or -1 if the driver cannot tell.
+ * Many drivers only update this once per fragment, so callers should smooth it. */
+static int audio_queued_oss(void) {
+    int bytes = 0;
+
+    if (oss_fd < 0 || audio_channels <= 0)
+        return -1;
+    if (ioctl(oss_fd, SNDCTL_DSP_GETODELAY, &bytes) < 0)
+        return -1;
+    if (bytes < 0)
+        bytes = 0;
+    return bytes / (audio_channels * (int)sizeof(int16_t));
+}
+
 static void audio_close_oss(void) {
     if (oss_fd >= 0) {
 		(void)ioctl(oss_fd, SNDCTL_DSP_SYNC, 0);
@@ -301,6 +332,17 @@ static int audio_write_tinyalsa(const int16_t *pcm, int frames) {
     }
 
     return 0;
+}
+
+/* Frames written but not yet played. 0 before the stream has started and after
+ * an underrun (the kernel then refuses the query, and nothing is queued). */
+static int audio_queued_tinyalsa(void) {
+    long delay;
+
+    if (!tiny_pcm)
+        return -1;
+    delay = pcm_get_delay(tiny_pcm);
+    return delay < 0 ? 0 : (int)delay;
 }
 
 static void audio_close_tinyalsa(void) {

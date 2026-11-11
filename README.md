@@ -51,7 +51,7 @@ midiero is crafted to be completely independent of bloated desktop frameworks (l
 Ensure you have the X11 development headers installed on your Linux system (e.g., `libx11-dev` on Debian/Ubuntu).
 
 View the build options in Makefile. 
-A threaded and a non threaded build is possible toggling flag -DTHREAD - for best graphics the threaded version is recommended.
+A threaded and a non threaded build is possible toggling flag -DTHREAD. Both show the notes in sync with what is heard (the sound card's output delay is compensated). The non threaded build keeps `TARGET_QUEUE_MS` (default 70 ms) of audio queued; raise it on very slow machines. Set `TARGET_FPS` to the monitor refresh rate for the smoothest scrolling.
 OSS only, TinyALSA only or both is possible. If both are compiled in via -DAUDIO_HAVE_OSS -DAUDIO_HAVE_TINYALSA  - the OSS is tried first with TinyALSA as fallback.
 
 ## Usage

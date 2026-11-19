@@ -57,7 +57,7 @@
 //end xfileselect area
 
 #define SAMPLE_RATE		48000		//48000 more universal than 44100
-#define MASTER_GAIN_DB	-6.0f		//headroom: TinySoundFont mixes at full scale, so songs overshoot 2-5x
+#define MASTER_GAIN_DB	-3.0f		//headroom so dense songs rarely reach the limiter
 #define BUFFER_SIZE		2048		//threaded build: frames rendered per audio_write (the thread blocks on it)
 #define WINDOW_WIDTH	800
 #define WINDOW_HEIGHT	600
@@ -436,6 +436,7 @@ static void reset_channels(tsf* f) {
     tsf_reset(f); // stop all voices
     for (int i = 0; i < 16; i++) {
         tsf_channel_midi_control(f, i, 121, 0); // Reset All Controllers (volume, pan, bank, pitch range ...)
+        tsf_channel_midi_control(f, i, 7, 100); // General MIDI default channel volume (TSF resets to 127)
         tsf_channel_set_sustain(f, i, 0);
         tsf_channel_set_pitchwheel(f, i, 8192);
         tsf_channel_set_presetnumber(f, i, 0, (i == 9));

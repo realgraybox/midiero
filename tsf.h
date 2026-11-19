@@ -649,7 +649,9 @@ static void tsf_region_operator(struct tsf_region* region, tsf_u16 genOper, unio
 						case GEN_FLOAT_LIMIT12K8K: vfactor =   1.0f; vmin = -12000.0f; vmax = 8000.0f; break;
 						case GEN_FLOAT_LIMIT1200:  vfactor =   1.0f; vmin =  -1200.0f; vmax = 1200.0f; break;
 						case GEN_FLOAT_LIMITPAN:   vfactor = 0.001f; vmin =     -0.5f; vmax =    0.5f; break;
-						case GEN_FLOAT_LIMITATTN:  vfactor =  0.01f; vmin =      0.0f; vmax =   14.4f; break;
+						// midiero: attenuation (centibels) is applied at 40 % like the E-mu hardware and FluidSynth,
+						// which most SoundFonts are balanced for (cB * 0.1 * 0.4 = dB). Upstream applied 10 %.
+						case GEN_FLOAT_LIMITATTN:  vfactor =  0.04f; vmin =      0.0f; vmax =   57.6f; break;
 						case GEN_FLOAT_MAX1000:    vfactor =   1.0f; vmin =      0.0f; vmax = 1000.0f; break;
 						case GEN_FLOAT_MAX1440:    vfactor =   1.0f; vmin =      0.0f; vmax = 1440.0f; break;
 						default: continue;
@@ -1616,7 +1618,8 @@ TSFDEF int tsf_note_on(tsf* f, int preset_index, int key, float vel)
 		voice->playingKey = key;
 		voice->playIndex = voicePlayIndex;
 		voice->heldSustain = 0;
-		voice->noteGainDB = f->globalGainDB - region->attenuation - tsf_gainToDecibels(1.0f / vel);
+		// midiero: velocity follows the SoundFont default (concave) curve, gain = (vel/127)^2, instead of linear
+		voice->noteGainDB = f->globalGainDB - region->attenuation - 2.0f * tsf_gainToDecibels(1.0f / vel);
 
 		if (f->channels)
 		{
@@ -2025,7 +2028,8 @@ TSFDEF int tsf_channel_midi_control(tsf* f, int channel, int controller, int con
 	return 1;
 TCMC_SET_VOLUME:
 	//Raising to the power of 3 seems to result in a decent sounding volume curve for MIDI
-	tsf_channel_set_volume(f, channel, TSF_POWF((c->midiVolume / 16383.0f) * (c->midiExpression / 16383.0f), 3.0f));
+	// midiero: General MIDI volume curve (40 log10 for volume and expression), gain = (vol * expr)^2, instead of a cube
+	tsf_channel_set_volume(f, channel, TSF_POWF((c->midiVolume / 16383.0f) * (c->midiExpression / 16383.0f), 2.0f));
 	return 1;
 TCMC_SET_PAN:
 	tsf_channel_set_pan(f, channel, c->midiPan / 16383.0f);

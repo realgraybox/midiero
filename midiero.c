@@ -57,6 +57,7 @@
 //end xfileselect area
 
 #define SAMPLE_RATE		48000		//48000 more universal than 44100
+#define MASTER_GAIN_DB	-6.0f		//headroom: TinySoundFont mixes at full scale, so songs overshoot 2-5x
 #define BUFFER_SIZE		2048		//threaded build: frames rendered per audio_write (the thread blocks on it)
 #define WINDOW_WIDTH	800
 #define WINDOW_HEIGHT	600
@@ -162,6 +163,80 @@ static double get_monotonic_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+}
+
+// =========================================================================
+// OUTPUT STAGE: synth (float) -> look-ahead peak limiter -> 16-bit samples
+// =========================================================================
+// tsf_render_short() cuts every sample above full scale off hard, which sounds
+// loud and scratchy. Instead the mix is rendered as float, with MASTER_GAIN_DB of
+// headroom, and a limiter turns the gain down smoothly just before a peak would
+// pass LIMITER_THRESHOLD, then lets it recover over LIMITER_RELEASE_S.
+// The look-ahead delays the sound by LIMITER_LOOKAHEAD frames (1.3 ms).
+// Only called from the audio side (audio thread / single-threaded loop).
+#define LIMITER_LOOKAHEAD	64			//frames
+#define LIMITER_THRESHOLD	0.891f		//-1 dBFS
+#define LIMITER_RELEASE_S	0.15f
+#define RENDER_BLOCK		256			//frames rendered per tsf_render_float() call
+
+static void render_audio(tsf* f, short* out, int frames) {
+    static float block[RENDER_BLOCK * 2];
+    static float delay_line[LIMITER_LOOKAHEAD * 2];
+    static float needed[LIMITER_LOOKAHEAD];	//gain each delayed frame needs (ring)
+    static int pos = 0;
+    static float gain = 1.0f;
+    static float window_min = 1.0f;		//smallest 'needed' in the ring ...
+    static int window_min_age = 0;		//... and how many frames ago it entered
+    static bool init = false;
+    static float attack, release;
+
+    if (!init) {
+        for (int i = 0; i < LIMITER_LOOKAHEAD; i++) needed[i] = 1.0f;
+        attack  = (float)(1.0 - exp(-4.0 / LIMITER_LOOKAHEAD));	//~98 % of the way within the look-ahead
+        release = (float)(1.0 - exp(-1.0 / (LIMITER_RELEASE_S * SAMPLE_RATE)));
+        init = true;
+    }
+
+    while (frames > 0) {
+        int n = frames > RENDER_BLOCK ? RENDER_BLOCK : frames;
+        tsf_render_float(f, block, n, 0);
+
+        for (int i = 0; i < n; i++) {
+            float l = block[2 * i], r = block[2 * i + 1];
+            float al = l < 0.0f ? -l : l, ar = r < 0.0f ? -r : r; //no fabsf: missing in old uClibc
+            float peak = al > ar ? al : ar;
+            float need = peak > LIMITER_THRESHOLD ? LIMITER_THRESHOLD / peak : 1.0f;
+
+            // Smallest gain needed by any frame within the look-ahead window
+            needed[pos] = need;
+            if (need <= window_min) {
+                window_min = need;
+                window_min_age = 0;
+            } else if (++window_min_age >= LIMITER_LOOKAHEAD) {
+                window_min = 1.0f; // the minimum left the window: rescan (rare)
+                for (int k = 0; k < LIMITER_LOOKAHEAD; k++) {
+                    if (needed[k] <= window_min) {
+                        window_min = needed[k];
+                        window_min_age = (pos - k + LIMITER_LOOKAHEAD) % LIMITER_LOOKAHEAD;
+                    }
+                }
+            }
+            gain += (window_min - gain) * (window_min < gain ? attack : release);
+
+            // Output the frame that entered LIMITER_LOOKAHEAD frames ago
+            float ol = delay_line[2 * pos] * gain, orr = delay_line[2 * pos + 1] * gain;
+            delay_line[2 * pos] = l;
+            delay_line[2 * pos + 1] = r;
+            pos = (pos + 1) % LIMITER_LOOKAHEAD;
+
+            if (ol > 1.0f) ol = 1.0f; else if (ol < -1.0f) ol = -1.0f; //safety only
+            if (orr > 1.0f) orr = 1.0f; else if (orr < -1.0f) orr = -1.0f;
+            out[2 * i] = (short)(ol * 32767.0f);
+            out[2 * i + 1] = (short)(orr * 32767.0f);
+        }
+        out += 2 * n;
+        frames -= n;
+    }
 }
 
 // =========================================================================
@@ -557,7 +632,7 @@ void skift_soundfont(const char* sti, tsf** nuvaerende_tsf, tml_message* song_st
     }
 
     // Configure the new output format
-    tsf_set_output(ny_tsf, TSF_STEREO_INTERLEAVED, SAMPLE_RATE, 0.0f);
+    tsf_set_output(ny_tsf, TSF_STEREO_INTERLEAVED, SAMPLE_RATE, MASTER_GAIN_DB);
 
 #ifdef THREAD
     pthread_mutex_lock(&audio_mutex);
@@ -603,7 +678,7 @@ static void *audio_thread(void *arg) {
                 g_current_msg = g_current_msg->next;
             }
 
-            tsf_render_short(*tsf_ptr, sample_buffer, BUFFER_SIZE, 0);
+            render_audio(*tsf_ptr, sample_buffer, BUFFER_SIZE);
             g_time_ms = next_time_ms;
             chunk_song_end = next_time_ms;
 
@@ -938,7 +1013,7 @@ int main(int argc, char *argv[]) {
                     current_msg = current_msg->next;
                 }
 
-                tsf_render_short(g_tsf, sample_buffer, CHUNK_FRAMES, 0);
+                render_audio(g_tsf, sample_buffer, CHUNK_FRAMES);
                 g_time_ms = next_time_ms;
             } else {
                 // Paused: keep the device fed with silence (no underruns)

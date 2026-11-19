@@ -1645,7 +1645,12 @@ TSFDEF int tsf_note_on(tsf* f, int preset_index, int key, float vel)
 		// Setup lowpass filter.
 		lowpassFc = (region->initialFilterFc <= 13500 ? tsf_cents2Hertz((float)region->initialFilterFc) / f->outSampleRate : 1.0f);
 		lowpassFilterQDB = region->initialFilterQ / 10.0f;
-		voice->lowpass.QInv = 1.0 / TSF_POW(10.0, (lowpassFilterQDB / 20.0));
+		// midiero: SoundFont 2.01 (8.1.3 #9, initialFilterQ), as FluidSynth, BASSMIDI and the Audigy do it:
+		// a Q of 0 dB gives no resonance hump (Butterworth, -3.01 dB at the cutoff), and the DC gain
+		// is reduced by half the resonance (e.g. 6 dB Q -> -3 dB). Without this, resonant pads and FX
+		// (Fantasia, Atmosphere ...) play several dB too loud.
+		voice->lowpass.QInv = 1.0 / TSF_POW(10.0, ((lowpassFilterQDB - 3.01) / 20.0));
+		voice->noteGainDB -= lowpassFilterQDB * 0.5f;
 		voice->lowpass.z1 = voice->lowpass.z2 = 0;
 		voice->lowpass.active = (lowpassFc < 0.499f);
 		if (voice->lowpass.active) tsf_voice_lowpass_setup(&voice->lowpass, lowpassFc);

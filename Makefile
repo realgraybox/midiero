@@ -36,6 +36,11 @@ CFLAGS += -Os -Wall -Wshadow -Wextra -Wno-deprecated-declarations \
 			--std=gnu99 -ffunction-sections -fdata-sections \
 			-I./audio -I./xfileselect -DAUDIO_HAVE_OSS -DAUDIO_HAVE_TINYALSA
 			
+# make DEBUG_TIMING=1 : the single-threaded build prints main-loop/audio timing to stderr
+ifeq ($(DEBUG_TIMING),1)
+CFLAGS += -DDEBUG_TIMING
+endif
+
 LDFLAGS += $(STATIC) -Wl,--gc-sections,--sort-common,-s -lX11 -lm
 
 THREAD ?= 0

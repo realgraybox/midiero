@@ -291,6 +291,13 @@ static int playback_queued_frames(void) {
     static double est_played = 0.0, est_wall = 0.0;
     int q = audio_queued_frames();
     if (q >= 0) return q;
+#ifdef DEBUG_TIMING
+    static bool told = false;
+    if (!told) {
+        fprintf(stderr, "DEBUG_TIMING: the audio driver cannot report its queue; estimating it from the clock\n");
+        told = true;
+    }
+#endif
 
     double now = get_monotonic_ms();
     if (est_wall != 0.0) est_played += (now - est_wall) * SAMPLE_RATE / 1000.0; //first call: playback starts now
@@ -298,6 +305,66 @@ static int playback_queued_frames(void) {
     if (est_played > (double)g_frames_written) est_played = (double)g_frames_written; //underrun
     return (int)(g_frames_written - (long long)est_played);
 }
+
+#if defined(DEBUG_TIMING) && !defined(THREAD)
+// =========================================================================
+// DEBUG_TIMING (single-threaded build): where does the main loop spend its time
+// when the audio queue runs low? Build with: make DEBUG_TIMING=1
+// Prints to stderr - redirect it to a file (2> timing.log) so a slow terminal
+// does not cause stalls itself.
+// =========================================================================
+#define DBG_SLOW_MS		25.0	// report any loop phase that takes longer than this
+#define DBG_START_S		3.0		// report every loop this long after playback starts
+
+typedef struct {
+    double events, audio, draw, xsync, sleep;	// ms spent in each phase
+    int x_events, chunks;
+    double render_max, write_max;				// slowest single chunk render / write (ms)
+    double q_start, q_after;					// queue (ms) at loop start / after topping up
+    bool paused;
+} dbg_loop_t;
+
+static dbg_loop_t g_dbg;			// loop being measured
+static bool g_dbg_valid = false;
+static double g_dbg_t0 = -1.0;		// program start (ms)
+static double g_dbg_play = -1.0;	// when playback last started (ms), -1 = paused
+
+static double dbg_frames_ms(int frames) { return frames * 1000.0 / SAMPLE_RATE; }
+
+// Called at the top of every loop with the queue level now: reports the loop that just ended
+static void dbg_loop_end(double now, int queued_now, bool paused_now) {
+    if (g_dbg_t0 < 0.0) g_dbg_t0 = now;
+    if (!paused_now && g_dbg_play < 0.0) {
+        g_dbg_play = now;
+        fprintf(stderr, "[%8.3f s] ---- playback started, queue %.1f ms (target %d ms)\n",
+                (now - g_dbg_t0) / 1000.0, dbg_frames_ms(queued_now), TARGET_QUEUE_MS);
+    } else if (paused_now) {
+        g_dbg_play = -1.0;
+    }
+
+    if (g_dbg_valid) {
+        const dbg_loop_t* d = &g_dbg;
+        double q_now = dbg_frames_ms(queued_now);
+        bool low = !d->paused && q_now < TARGET_QUEUE_MS / 4.0;
+        bool slow = d->events > DBG_SLOW_MS || d->audio > DBG_SLOW_MS || d->draw > DBG_SLOW_MS ||
+                    d->xsync > DBG_SLOW_MS || d->sleep > DBG_SLOW_MS;
+        bool start = g_dbg_play >= 0.0 && now - g_dbg_play < DBG_START_S * 1000.0;
+        if (low || slow || start) {
+            fprintf(stderr, "[%8.3f s] %-5s queue %5.1f -> %5.1f -> now %5.1f ms | events %5.1f (%2d X) | "
+                            "audio %5.1f (%2d chunks, render max %4.1f, write max %4.1f) | draw %5.1f | "
+                            "xsync %5.1f | sleep %5.1f%s\n",
+                    (now - g_dbg_t0) / 1000.0, low ? "LOW" : slow ? "SLOW" : "start",
+                    d->q_start, d->q_after, q_now, d->events, d->x_events,
+                    d->audio, d->chunks, d->render_max, d->write_max, d->draw,
+                    d->xsync, d->sleep, d->paused ? " (paused)" : "");
+        }
+    }
+    memset(&g_dbg, 0, sizeof g_dbg);
+    g_dbg.q_start = dbg_frames_ms(queued_now);
+    g_dbg.paused = paused_now;
+    g_dbg_valid = true;
+}
+#endif
 
 // Audio side: a chunk of 'frames' frames covering song time song_start..song_end
 // (equal while paused) has just been written to the device.
@@ -815,11 +882,21 @@ int main(int argc, char *argv[]) {
 	bool running = true;
 #endif
 	double next_frame_ms = get_monotonic_ms();
+#if defined(DEBUG_TIMING) && !defined(THREAD)
+	double dbg_mark = 0.0;
+#endif
     while (running) {
+#if defined(DEBUG_TIMING) && !defined(THREAD)
+        dbg_mark = get_monotonic_ms();
+        dbg_loop_end(dbg_mark, playback_queued_frames(), g_is_paused || !g_midi);
+#endif
         int target_channel = -1;
         while (XPending(display)) {
             XEvent event;
             XNextEvent(display, &event);
+#if defined(DEBUG_TIMING) && !defined(THREAD)
+            g_dbg.x_events++;
+#endif
             // Allows the game to be closed using the window's "X" button with the mouse.
 			if (event.type == ClientMessage) {
 				if ((Atom)event.xclient.data.l[0] == wm_delete_window) {
@@ -985,6 +1062,9 @@ int main(int argc, char *argv[]) {
 #endif                
             }
         }
+#if defined(DEBUG_TIMING) && !defined(THREAD)
+        { double t = get_monotonic_ms(); g_dbg.events = t - dbg_mark; dbg_mark = t; }
+#endif
 #ifndef THREAD
         // --- AUDIO: top the device up to TARGET_QUEUE_MS in small chunks ---
         // Only writes while there is room, so the loop does not wait for the sound card
@@ -1014,7 +1094,14 @@ int main(int argc, char *argv[]) {
                     current_msg = current_msg->next;
                 }
 
+#if defined(DEBUG_TIMING)
+                double dbg_r = get_monotonic_ms();
+#endif
                 render_audio(g_tsf, sample_buffer, CHUNK_FRAMES);
+#if defined(DEBUG_TIMING)
+                dbg_r = get_monotonic_ms() - dbg_r;
+                if (dbg_r > g_dbg.render_max) g_dbg.render_max = dbg_r;
+#endif
                 g_time_ms = next_time_ms;
             } else {
                 // Paused: keep the device fed with silence (no underruns)
@@ -1028,6 +1115,13 @@ int main(int argc, char *argv[]) {
                 break;
             }
             clock_audio_written(CHUNK_FRAMES, chunk_song_start, g_time_ms);
+#if defined(DEBUG_TIMING)
+            {
+                double w = get_monotonic_ms() - write_start_ms;
+                if (w > g_dbg.write_max) g_dbg.write_max = w;
+                g_dbg.chunks++;
+            }
+#endif
 
             // The write had to wait: the device buffer is smaller than TARGET_QUEUE_MS
             // (or the driver under-reports its delay). Stop here so drawing is not held up.
@@ -1035,6 +1129,10 @@ int main(int argc, char *argv[]) {
         }
 #endif
 
+#if defined(DEBUG_TIMING) && !defined(THREAD)
+        { double t = get_monotonic_ms(); g_dbg.audio = t - dbg_mark; dbg_mark = t;
+          g_dbg.q_after = dbg_frames_ms(playback_queued_frames()); }
+#endif
         // --- Song time of the sound being heard right now (both builds) ---
 #ifdef THREAD
         pthread_mutex_lock(&audio_mutex);
@@ -1300,7 +1398,13 @@ int main(int argc, char *argv[]) {
 				XCopyArea(display, pixmap, window, gc, 0, 0, W, H, 0, 0);
 				// Wait until the X server has executed this frame, so frames can never
 				// pile up in its queue (and lag behind the sound) on a slow display.
+#if defined(DEBUG_TIMING) && !defined(THREAD)
+				{ double t = get_monotonic_ms(); g_dbg.draw = t - dbg_mark; dbg_mark = t; }
+#endif
 				XSync(display, False);
+#if defined(DEBUG_TIMING) && !defined(THREAD)
+				{ double t = get_monotonic_ms(); g_dbg.xsync = t - dbg_mark; dbg_mark = t; }
+#endif
 
 				// Sleep until the next frame is due (absolute deadline, so drawing time
 				// does not lower the frame rate). If far behind (e.g. after a file
@@ -1309,6 +1413,9 @@ int main(int argc, char *argv[]) {
 				double now_ms = get_monotonic_ms();
 				if (next_frame_ms < now_ms - FRAME_TIME_MS) next_frame_ms = now_ms;
 				if (next_frame_ms > now_ms) usleep((unsigned int)((next_frame_ms - now_ms) * 1000.0));
+#if defined(DEBUG_TIMING) && !defined(THREAD)
+				g_dbg.sleep = get_monotonic_ms() - dbg_mark;
+#endif
     }
 
     // 8. Clean up

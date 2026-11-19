@@ -237,6 +237,22 @@ static int audio_init_oss(int rate, int channels) {
 
     fprintf(stderr, "Audio: OSS %d Hz, %d channel(s), S16_LE\n",
             audio_rate, audio_channels);
+#ifdef DEBUG_TIMING
+    {
+        audio_buf_info bi;
+        int delay = 0;
+        if (ioctl(fd, SNDCTL_DSP_GETOSPACE, &bi) == 0) {
+            int bytes = bi.fragstotal * bi.fragsize;
+            fprintf(stderr, "DEBUG_TIMING: OSS buffer %d fragments x %d bytes = %d bytes = %.1f ms\n",
+                    bi.fragstotal, bi.fragsize, bytes,
+                    bytes * 1000.0 / (audio_rate * audio_channels * 2));
+        } else {
+            fprintf(stderr, "DEBUG_TIMING: OSS SNDCTL_DSP_GETOSPACE failed: %s\n", strerror(errno));
+        }
+        if (ioctl(fd, SNDCTL_DSP_GETODELAY, &delay) < 0)
+            fprintf(stderr, "DEBUG_TIMING: OSS SNDCTL_DSP_GETODELAY failed: %s\n", strerror(errno));
+    }
+#endif
 
     return 0;
 
@@ -312,6 +328,10 @@ static int audio_init_tinyalsa(int rate, int channels) {
 
     fprintf(stderr, "Audio: TinyALSA %d Hz, %d channel(s), S16_LE\n",
             rate, channels);
+#ifdef DEBUG_TIMING
+    fprintf(stderr, "DEBUG_TIMING: TinyALSA buffer %u frames = %.1f ms\n",
+            pcm_get_buffer_size(tiny_pcm), pcm_get_buffer_size(tiny_pcm) * 1000.0 / rate);
+#endif
 
     return 0;
 }

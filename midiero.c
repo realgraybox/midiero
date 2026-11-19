@@ -306,6 +306,25 @@ static int playback_queued_frames(void) {
     return (int)(g_frames_written - (long long)est_played);
 }
 
+#ifndef THREAD
+// =========================================================================
+// X BACKLOG (single-threaded build): the main loop must never wait for the X server,
+// or the sound card runs dry. Window moves make the server slow, and some window
+// managers grab it for up to a second at the start of a drag. So instead of XSync()
+// we look at how much we have sent that the X server has not read yet, and skip
+// drawing while it is behind. Linux reports this for the socket (TIOCOUTQ); where it
+// cannot, every frame is drawn and XSync() is used as before.
+// =========================================================================
+#include <sys/ioctl.h>
+#define X_BACKLOG_LIMIT	(32 * 1024)		//bytes the X server may lag behind before frames are skipped
+
+static int x_backlog(Display* d) {
+    int pending = 0;
+    if (ioctl(ConnectionNumber(d), TIOCOUTQ, &pending) < 0) return -1;
+    return pending;
+}
+#endif
+
 #if defined(DEBUG_TIMING) && !defined(THREAD)
 // =========================================================================
 // DEBUG_TIMING (single-threaded build): where does the main loop spend its time
@@ -322,6 +341,8 @@ typedef struct {
     double render_max, write_max;				// slowest single chunk render / write (ms)
     double q_start, q_after;					// queue (ms) at loop start / after topping up
     bool paused;
+    int x_backlog;								// bytes the X server had not read yet (-1 = unknown)
+    bool skipped;								// frame not drawn because X was behind
 } dbg_loop_t;
 
 static dbg_loop_t g_dbg;			// loop being measured
@@ -349,14 +370,15 @@ static void dbg_loop_end(double now, int queued_now, bool paused_now) {
         bool slow = d->events > DBG_SLOW_MS || d->audio > DBG_SLOW_MS || d->draw > DBG_SLOW_MS ||
                     d->xsync > DBG_SLOW_MS || d->sleep > DBG_SLOW_MS;
         bool start = g_dbg_play >= 0.0 && now - g_dbg_play < DBG_START_S * 1000.0;
-        if (low || slow || start) {
+        if (low || slow || start || d->skipped) {
             fprintf(stderr, "[%8.3f s] %-5s queue %5.1f -> %5.1f -> now %5.1f ms | events %5.1f (%2d X) | "
                             "audio %5.1f (%2d chunks, render max %4.1f, write max %4.1f) | draw %5.1f | "
-                            "xsync %5.1f | sleep %5.1f%s\n",
-                    (now - g_dbg_t0) / 1000.0, low ? "LOW" : slow ? "SLOW" : "start",
+                            "x flush %5.1f | sleep %5.1f | X backlog %5.1f KB%s%s\n",
+                    (now - g_dbg_t0) / 1000.0, low ? "LOW" : slow ? "SLOW" : d->skipped ? "SKIP" : "start",
                     d->q_start, d->q_after, q_now, d->events, d->x_events,
                     d->audio, d->chunks, d->render_max, d->write_max, d->draw,
-                    d->xsync, d->sleep, d->paused ? " (paused)" : "");
+                    d->xsync, d->sleep, d->x_backlog / 1024.0,
+                    d->skipped ? " (frame skipped)" : "", d->paused ? " (paused)" : "");
         }
     }
     memset(&g_dbg, 0, sizeof g_dbg);
@@ -901,7 +923,12 @@ int main(int argc, char *argv[]) {
         dbg_loop_end(dbg_mark, playback_queued_frames(), g_is_paused || !g_song.count);
 #endif
         int target_channel = -1;
+#ifdef THREAD
         while (XPending(display)) {
+#else
+        // Read what has arrived without flushing our output: that could block on a busy X server
+        while (XEventsQueued(display, QueuedAfterReading)) {
+#endif
             XEvent event;
             XNextEvent(display, &event);
 #if defined(DEBUG_TIMING) && !defined(THREAD)
@@ -1144,6 +1171,19 @@ int main(int argc, char *argv[]) {
         double graphic_time_ms = clock_song_time();
 #ifdef THREAD
         pthread_mutex_unlock(&audio_mutex);
+#endif
+#ifndef THREAD
+        // X is behind (window being moved, server grabbed ...): keep the audio going, draw later
+        int backlog = x_backlog(display);
+#if defined(DEBUG_TIMING)
+        g_dbg.x_backlog = backlog;
+#endif
+        if (backlog > X_BACKLOG_LIMIT) {
+#if defined(DEBUG_TIMING)
+            g_dbg.skipped = true;
+#endif
+            goto frame_done;
+        }
 #endif
 		// =========================================================================
         // 7. FULLY DYNAMIC & SCALABLE GRAPHICS (Xlib resizing supported)
@@ -1402,14 +1442,22 @@ int main(int argc, char *argv[]) {
                 XDrawString(display, pixmap, gc, 20, H - 20, status_str, strlen(status_str));
 				// Copy the entire dynamic frame to the window				
 				XCopyArea(display, pixmap, window, gc, 0, 0, W, H, 0, 0);
-				// Wait until the X server has executed this frame, so frames can never
-				// pile up in its queue (and lag behind the sound) on a slow display.
 #if defined(DEBUG_TIMING) && !defined(THREAD)
 				{ double t = get_monotonic_ms(); g_dbg.draw = t - dbg_mark; dbg_mark = t; }
 #endif
+#ifdef THREAD
+				// Wait until the X server has executed this frame, so frames can never
+				// pile up in its queue (and lag behind the sound) on a slow display.
 				XSync(display, False);
-#if defined(DEBUG_TIMING) && !defined(THREAD)
+#else
+				// Send the frame without waiting for it: the backlog check above keeps frames
+				// from piling up. Only if the backlog cannot be measured, wait as before.
+				if (backlog < 0) XSync(display, False);
+				else XFlush(display);
+#if defined(DEBUG_TIMING)
 				{ double t = get_monotonic_ms(); g_dbg.xsync = t - dbg_mark; dbg_mark = t; }
+#endif
+frame_done:
 #endif
 
 				// Sleep until the next frame is due (absolute deadline, so drawing time

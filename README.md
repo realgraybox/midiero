@@ -42,8 +42,7 @@ Not related to SpyderTL/MidiHero, a Windows practice utility for isolating instr
 midiero is crafted to be completely independent of bloated desktop frameworks (like GTK or Qt) and external server-side synths. 
 
 - **Graphics & Input:** Pure X11 / Xlib
-- **MIDI Parsing:** `tml.h` (Tiny MIDI Loader)
-- **Sound Synthesis:** `tsf.h` (TinySoundFont)
+- **MIDI Parsing and Sound Synthesis:** [mmidi](https://github.com/realgraybox/mmidi) (its `v2/` engine, bundled in `mmidi/`, zlib licensed): Standard MIDI files of format 0, 1 and 2 (format 2 sequences back to back) and RIFF RMID, a SoundFont 2 synthesizer with the bank's own per-instrument reverb and chorus, built `.sf2`-only (`-DMM_NO_MODELS`). midiero reads the song's events from mmidi once and runs its own sequencer, so pause, speed and the note display work as before.
 - **Audio Output:** OSS and/or TinyALSA
 
 ## Installation & Compilation
@@ -53,6 +52,8 @@ Ensure you have the X11 development headers installed on your Linux system (e.g.
 View the build options in Makefile. 
 A threaded and a non threaded build is possible toggling flag -DTHREAD. Both show the notes in sync with what is heard (the sound card's output delay is compensated). The non threaded build keeps `TARGET_QUEUE_MS` (default 70 ms) of audio queued; raise it on very slow machines. Set `TARGET_FPS` to the monitor refresh rate for the smoothest scrolling.
 OSS only, TinyALSA only or both is possible. If both are compiled in via -DAUDIO_HAVE_OSS -DAUDIO_HAVE_TINYALSA  - the OSS is tried first with TinyALSA as fallback.
+`MASTER_VOLUME` in `midiero.c` sets the synth's level (default 0.7); a look-ahead limiter keeps peaks below -1 dBFS.
+Options for the bundled mmidi (`-DMM_NO_REVERB`, `-DMM_NO_CHORUS`, `-DMAXVOICE=n`) go in `CFLAGS` in the environment, e.g. `CFLAGS="-DMM_NO_CHORUS" make`; see `mmidi/README.md`. i386 builds with SSE2 maths (`CFLAGS="-msse2 -mfpmath=sse"`) get the stack alignment they need from the Makefile.
 
 ## Usage
 

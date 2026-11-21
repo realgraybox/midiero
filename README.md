@@ -8,7 +8,7 @@ A lightweight, interactive MIDI visualization and music learning tool for Linux.
 
 Conceptually inspired by games like *Guitar Hero*, **midiero** focuses on helping users see, hear, and learn music through proper musical notation rather than abstract blocks.
 
-With a fully static build utilizing `uclibc`, the entire application—including its internal SoundFont synthesizer—compiles into a standalone binary of **around 400 KB**, making it exceptionally resource-efficient and portable.
+With a fully static build utilizing `uclibc`, the entire application—including its internal SoundFont synthesizer—compiles into a standalone binary of **around 348 KB** (single-threaded; the threaded build with DEBUG_TIMING is about 405 KB), making it exceptionally resource-efficient and portable.
 
 Not related to SpyderTL/MidiHero, a Windows practice utility for isolating instrument tracks — midiero is a Linux-native, dependency-free MIDI visualizer with live notation.
 

@@ -99,8 +99,6 @@ bool g_is_paused = false;
 bool g_channels_enabled[16];
 
 
-int g_channel_preset_index[16] = {0}; // Preset the synth really uses per channel (bank-aware, for the legend)
-bool g_channel_has_played[16] = {false}; // Checking whether the track actually contains music.
 char g_nuvaerende_midi_navn[256] = "No MIDI loaded - Use key [L]";
 char g_nuvaerende_sf2_navn[256]  = "Build in Nokia Bank (Default)";
 
@@ -486,7 +484,6 @@ static void send_midi_event(mm_synth* f, const mm_event* e, bool play_notes) {
     if (e->status == 0xFE) {
         // Format 2: the next sequence starts. mmidi releases the notes and resets the channels.
         mm_midi(f, 0xFE, 0, 0);
-        for (int i = 0; i < 16; i++) g_channel_preset_index[i] = mm_channel_preset(f, i);
         return;
     }
 
@@ -494,7 +491,6 @@ static void send_midi_event(mm_synth* f, const mm_event* e, bool play_notes) {
     case 0x90: // note on (a note-on with velocity 0 arrives as a note-off)
         if (!play_notes)
             break;
-        g_channel_has_played[ch] = true; // The track is now in use!
         if (g_channels_enabled[ch])
             mm_midi(f, e->status, e->d1, e->d2);
         break;
@@ -505,8 +501,6 @@ static void send_midi_event(mm_synth* f, const mm_event* e, bool play_notes) {
     case 0xC0: // program change: channel 10 picks a drum kit, as in General MIDI
     case 0xB0: // volume, expression, pan, sustain, bank select, RPN pitch-bend range ...
         mm_midi(f, e->status, e->d1, e->d2);
-        if (type == 0xC0 || e->d1 == 0)
-            g_channel_preset_index[ch] = mm_channel_preset(f, ch); // bank-aware, for the legend
         break;
     case 0xE0:
         mm_midi(f, e->status, e->d1, e->d2);
@@ -518,8 +512,6 @@ static void send_midi_event(mm_synth* f, const mm_event* e, bool play_notes) {
 // all voices and effects off, General MIDI defaults (volume 100, piano, channel 10 drums).
 static void reset_channels(mm_synth* f) {
     mm_reset(f);
-    for (int i = 0; i < 16; i++)
-        g_channel_preset_index[i] = mm_channel_preset(f, i);
 }
 
 // =========================================================================
@@ -591,6 +583,95 @@ static void byg_node_tabel(const song_t* song) {
         }
     }
     free(forrige);
+}
+
+// =========================================================================
+// INSTRUMENT STRETCHES (legend only - built and used by the main thread)
+// =========================================================================
+// A stretch is one instrument (bank + program) on one channel, from its first note
+// to the end of its last note there. The legend shows a channel's instrument only
+// while the song position being heard is inside such a stretch, and "Not used"
+// before, between and after them. So instruments that are done, or have moved to
+// another channel, no longer fill up the legend. Long rests inside a stretch keep
+// the instrument shown. The table is sorted by first note (built in song order).
+typedef struct {
+    double first_ms, last_ms;	// start of the first note, end of the last note
+    int bank, prog;				// as the channel selected them (CC 0 / program change)
+    unsigned char channel;
+} straekning_t;
+
+static straekning_t* g_straek = NULL;
+static int g_straek_antal = 0;
+
+static void byg_straekninger(const song_t* song) {
+    static int note_straek[16][128];	// stretch of the sounding note per channel/key (-1 = none)
+    int bank[16], prog[16], cur[16];	// channel state while walking the song; cur = open stretch
+    int max_antal = 0;
+
+    free(g_straek);
+    g_straek = NULL;
+    g_straek_antal = 0;
+
+    for (int i = 0; i < song->count; i++)
+        if ((song->ev[i].status & 0xF0) == 0x90) max_antal++;	// at most one stretch per note
+    if (max_antal == 0) return;
+
+    g_straek = (straekning_t*)malloc((size_t)max_antal * sizeof(straekning_t));
+    if (!g_straek) {
+        fprintf(stderr, "Out of memory for the instrument stretches\n");
+        return;
+    }
+    for (int c = 0; c < 16; c++) {
+        bank[c] = 0; prog[c] = 0; cur[c] = -1;	// General MIDI power-on state, as reset_channels()
+        for (int k = 0; k < 128; k++) note_straek[c][k] = -1;
+    }
+
+    for (int i = 0; i < song->count; i++) {
+        const mm_event* m = &song->ev[i];
+        if (m->status == 0xFE) {	// format 2: the next sequence starts with reset channels
+            for (int c = 0; c < 16; c++) { bank[c] = 0; prog[c] = 0; cur[c] = -1; }
+            continue;
+        }
+        if (m->status >= 0xF0) continue;
+        int type = m->status & 0xF0, ch = m->status & 0x0F;
+        double time_ms = m->time * 1000.0;
+
+        if (type == 0xC0) {
+            prog[ch] = m->d1;
+        } else if (type == 0xB0 && m->d1 == 0) {
+            bank[ch] = m->d2;		// bank select, as mmidi uses it
+        } else if (type == 0x90) {
+            int key = m->d1 & 0x7F;
+            straekning_t* st = cur[ch] >= 0 ? &g_straek[cur[ch]] : NULL;
+            if (!st || st->bank != bank[ch] || st->prog != prog[ch]) {
+                // First note with a new instrument on this channel: a new stretch begins
+                cur[ch] = g_straek_antal++;
+                st = &g_straek[cur[ch]];
+                st->first_ms = st->last_ms = time_ms;
+                st->bank = bank[ch];
+                st->prog = prog[ch];
+                st->channel = (unsigned char)ch;
+            }
+            note_straek[ch][key] = cur[ch];
+        } else if (type == 0x80) {
+            // The note ends the stretch it started in, even if the program changed meanwhile
+            int k = note_straek[ch][m->d1 & 0x7F];
+            if (k >= 0 && time_ms > g_straek[k].last_ms) g_straek[k].last_ms = time_ms;
+            note_straek[ch][m->d1 & 0x7F] = -1;
+        }
+    }
+}
+
+// Preset of a stretch, chosen the way mmidi chooses it for a note: channel 10 plays
+// drum kits (bank 128, falling back to kit 0), the others fall back to bank 0.
+static int straek_preset(const mm_synth* syn, const straekning_t* st) {
+    int p;
+    if (st->channel == 9) {
+        if ((p = mm_preset_find(syn, 128, st->prog)) < 0) p = mm_preset_find(syn, 128, 0);
+    } else if ((p = mm_preset_find(syn, st->bank, st->prog)) < 0) {
+        p = mm_preset_find(syn, 0, st->prog);
+    }
+    return p;
 }
 
 // Index of the first note starting at or after t
@@ -846,6 +927,7 @@ int main(int argc, char *argv[]) {
         // If there is an argument, we always assume it is a MIDI file
         skift_midi_fil(argv[1], &g_song);
         byg_node_tabel(&g_song);
+        byg_straekninger(&g_song);
         g_time_ms = 0.0;
         g_current_ev = 0;
     }
@@ -860,6 +942,7 @@ int main(int argc, char *argv[]) {
         audio_close();
         song_free(&g_song);
         free(g_noder);
+        free(g_straek);
         return 1;
     }
 
@@ -870,6 +953,7 @@ int main(int argc, char *argv[]) {
         audio_close();
         song_free(&g_song);
         free(g_noder);
+        free(g_straek);
         mm_free(g_synth);
         return 1;
     }
@@ -1013,7 +1097,6 @@ int main(int argc, char *argv[]) {
 #endif
 							g_is_paused = true;
 							reset_channels(g_synth);
-							for (int i = 0; i < 16; i++) g_channel_has_played[i] = false; // Reset track history
 							g_song = ny_song;
 							g_current_ev = 0;
 							g_time_ms = 0.0; // Rewind to the beginning
@@ -1023,6 +1106,7 @@ int main(int argc, char *argv[]) {
 #endif
 							song_free(&gammel_song); // the audio thread no longer references it
 							byg_node_tabel(&g_song); // graphics only: no lock needed
+							byg_straekninger(&g_song);
                         }
                     }
 				}
@@ -1381,6 +1465,12 @@ int main(int argc, char *argv[]) {
         if (y_spacing > 30) y_spacing = 30; // Maximum distance for the sake of appearance
         int y_offset = 85;
 
+        // The instrument stretch each channel is in at the song position being heard
+        // (the latest started one if two overlap); NULL = the channel is not used now
+        const straekning_t* aktiv[16] = {NULL};
+        for (int i = 0; i < g_straek_antal && g_straek[i].first_ms <= graphic_time_ms; i++)
+            if (graphic_time_ms <= g_straek[i].last_ms) aktiv[g_straek[i].channel] = &g_straek[i];
+
         for (int i = 0; i < 16; i++) {
             char legend_item[128];
             char key_hint[16];
@@ -1388,39 +1478,38 @@ int main(int argc, char *argv[]) {
             else if (i == 9) snprintf(key_hint, sizeof(key_hint), "0");
             else snprintf(key_hint, sizeof(key_hint), "S+%d", i - 9);
 
-            if (!g_channel_has_played[i]) {
-                XSetForeground(display, gc, 0x333333); 
+            // Name of the preset this channel's current instrument plays (bank-aware)
+            char preset_name[21] = "";
+            if (aktiv[i] && mm_preset_info(g_synth, straek_preset(g_synth, aktiv[i]), NULL, NULL, preset_name) < 0)
+                snprintf(preset_name, sizeof preset_name, "%s", (i == 9) ? "Standard Drum Kit" : "Acoustic Grand Piano");
+
+            if (!g_channels_enabled[i]) {
+                // Muted: stays visible so the mute can be seen and undone, in use or not
+                XSetForeground(display, gc, 0x442222);
                 XFillRectangle(display, pixmap, gc, 15, y_offset - 8, 10, 8);
-                XSetForeground(display, gc, 0x444444); 
-                snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: Not used", key_hint, i + 1);
+                XSetForeground(display, gc, aktiv[i] ? 0x777777 : 0x444444);
+                if (aktiv[i])
+                    snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: [MUTED] %.10s", key_hint, i + 1, preset_name);
+                else
+                    snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: [MUTED] Not used", key_hint, i + 1);
                 XDrawString(display, pixmap, gc, 35, y_offset, legend_item, strlen(legend_item));
-            } 
-            else if (!g_channels_enabled[i]) {
-                XSetForeground(display, gc, 0x442222); 
+            }
+            else if (!aktiv[i]) {
+                XSetForeground(display, gc, 0x333333);
                 XFillRectangle(display, pixmap, gc, 15, y_offset - 8, 10, 8);
-                // Name of the preset the synth really uses on this channel (bank-aware)
-                char preset_name[21];
-                if (mm_preset_info(g_synth, g_channel_preset_index[i], NULL, NULL, preset_name) < 0)
-                    snprintf(preset_name, sizeof preset_name, "%s", (i == 9) ? "Standard Drum Kit" : "Acoustic Grand Piano");
-                XSetForeground(display, gc, 0x777777); 
-                snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: [MUTED] %.10s", key_hint, i + 1, preset_name);
+                XSetForeground(display, gc, 0x444444);
+                snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: Not used", key_hint, i + 1);
                 XDrawString(display, pixmap, gc, 35, y_offset, legend_item, strlen(legend_item));
             }
             else {
                 XSetForeground(display, gc, hent_kanal_farve(i));
                 XFillRectangle(display, pixmap, gc, 15, y_offset - 8, 10, 8);
-                
-                // Name of the preset the synth really uses on this channel (bank-aware)
-                char preset_name[21];
-                if (mm_preset_info(g_synth, g_channel_preset_index[i], NULL, NULL, preset_name) < 0)
-                    snprintf(preset_name, sizeof preset_name, "%s", (i == 9) ? "Standard Drum Kit" : "Acoustic Grand Piano");
-                
-                XSetForeground(display, gc, WhitePixel(display, screen)); 
+                XSetForeground(display, gc, WhitePixel(display, screen));
                 snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: %.16s", key_hint, i + 1, preset_name);
                 XDrawString(display, pixmap, gc, 35, y_offset, legend_item, strlen(legend_item));
-			}
-                y_offset += y_spacing;
-		}	
+            }
+            y_offset += y_spacing;
+        }
 
                 // --- ZONE 4: FOOTER (Slim bottom bar at the bottom of the screen) ---
                 XSetForeground(display, gc, 0x111111);
@@ -1488,6 +1577,7 @@ frame_done:
     audio_close();
     song_free(&g_song);
     free(g_noder);
+    free(g_straek);
     mm_free(g_synth);
     return 0;
 }

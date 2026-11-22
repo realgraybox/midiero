@@ -482,7 +482,8 @@ static void send_midi_event(mm_synth* f, const mm_event* e, bool play_notes) {
     if (e->status == 0xFF)
         return; // tempo: already applied to the event times
     if (e->status == 0xFE) {
-        // Format 2: the next sequence starts. mmidi releases the notes and resets the channels.
+        // Format 2: the next sequence starts. mmidi releases the sounding notes; the channels
+        // keep their instrument and controllers.
         mm_midi(f, 0xFE, 0, 0);
         return;
     }
@@ -628,8 +629,14 @@ static void byg_straekninger(const song_t* song) {
 
     for (int i = 0; i < song->count; i++) {
         const mm_event* m = &song->ev[i];
-        if (m->status == 0xFE) {	// format 2: the next sequence starts with reset channels
-            for (int c = 0; c < 16; c++) { bank[c] = 0; prog[c] = 0; cur[c] = -1; }
+        if (m->status == 0xFE) {	// format 2: the next sequence starts. mmidi releases the
+            double time_ms = m->time * 1000.0;	// sounding notes there; the channels keep their instrument
+            for (int c = 0; c < 16; c++)
+                for (int k = 0; k < 128; k++) {
+                    int s = note_straek[c][k];
+                    if (s >= 0 && time_ms > g_straek[s].last_ms) g_straek[s].last_ms = time_ms;
+                    note_straek[c][k] = -1;
+                }
             continue;
         }
         if (m->status >= 0xF0) continue;

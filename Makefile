@@ -41,7 +41,7 @@ TARGET = midiero
 
 CFLAGS += -Os -Wall -Wshadow -Wextra -Wno-deprecated-declarations \
 			--std=gnu99 -ffunction-sections -fdata-sections \
-			-I./audio -I./xfileselect -I./mmidi -DAUDIO_HAVE_OSS -DAUDIO_HAVE_TINYALSA \
+			-I./audio -I./xfileselect -I./mmidi -I./xbmfont -DAUDIO_HAVE_OSS -DAUDIO_HAVE_TINYALSA \
 			-DMM_NO_MODELS -DMM_NO_OSS
 # mmidi (mmidi/): .sf2 banks only, midiero has its own audio output. More
 # options (-DMM_NO_REVERB, -DMM_NO_CHORUS, -DMAXVOICE=n): see mmidi/README.md.

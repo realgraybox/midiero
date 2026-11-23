@@ -39,10 +39,16 @@
 #include <pthread.h>
 #endif
 
+// Text: xbmfont (xbmfont/), bitmap fonts built into the program, so midiero
+// looks the same on every X server. Its implementation is compiled here.
+#define XBMFONT_IMPLEMENTATION
+#include "xbmfont.h"
+#include "fonts/xbf_fixed_6x13.h"	// the look of X's own "fixed" font
+
 //xfileselect area
 #define FC_DEFAULT_WIDTH        500
 #define FC_DEFAULT_HEIGHT       300
-#define FC_FONT_NAME            "fixed"
+#define FC_FONT                 xbf_fixed_6x13
 #define FC_STATUS_PADDING_Y     4
 #define FC_HEADER_PADDING_Y     4
 #define FC_LINE_EXTRA           2
@@ -708,6 +714,7 @@ typedef struct {
 } kanal_batch_t;
 
 static kanal_batch_t g_batch[16];
+static xbf_ctx* g_txt = NULL;		// text font, uploaded once to the X server
 static XSegment g_ledger_c[BATCH], g_ledger_ydre[BATCH];	// middle-C ledger / outer ledger lines
 static int g_n_ledger_c = 0, g_n_ledger_ydre = 0;
 
@@ -727,7 +734,7 @@ static void tegn_batches(Display* d, Drawable p, GC gc) {
         XSetForeground(d, gc, hent_kanal_farve(ch));
         if (b->n_heads) XFillArcs(d, p, gc, b->heads, b->n_heads);
         for (int i = 0; i < b->n_sharps; i++)
-            XDrawString(d, p, gc, b->sharps[i].x, b->sharps[i].y, "#", 1);
+            xbf_draw(g_txt, p, b->sharps[i].x, b->sharps[i].y, hent_kanal_farve(ch), "#");
         b->n_heads = b->n_sharps = 0;
     }
     if (g_n_ledger_c) {								// 3. ledger lines
@@ -990,8 +997,11 @@ int main(int argc, char *argv[]) {
     GC gc = XCreateGC(display, window, 0, NULL);
     Pixmap pixmap = XCreatePixmap(display, window, WINDOW_WIDTH, WINDOW_HEIGHT, DefaultDepth(display, screen));
 
-    XFontStruct* font = XLoadQueryFont(display, "fixed");
-    if(font) XSetFont(display, gc, font->fid);
+    g_txt = xbf_create(display, window, &xbf_fixed_6x13, 1);
+    if (!g_txt) {
+        fprintf(stderr, "Could not upload the font to the X server\n");
+        return 1;
+    }
 #ifdef THREAD
 	bool audio_thread_started = (pthread_create(&audio_tid, NULL, audio_thread, &g_synth) == 0);
 	if (!audio_thread_started) {
@@ -1313,12 +1323,11 @@ int main(int argc, char *argv[]) {
         // --- ZONE 1: ALWAYS VISIBLE HEADER (Top) ---
         XSetForeground(display, gc, 0x222222); 
         XFillRectangle(display, pixmap, gc, 0, 0, W, top_h);
-        XSetForeground(display, gc, WhitePixel(display, screen));
         char header_str[600]; // room for both 256-char names
 
 		snprintf(header_str, sizeof(header_str), "  Midiero :: File: %s :: Bank: %s :: Resolution: %dx%d", g_nuvaerende_midi_navn, g_nuvaerende_sf2_navn, W, H);
         
-        XDrawString(display, pixmap, gc, 10, 24, header_str, strlen(header_str));
+        xbf_draw_fit(g_txt, pixmap, 10, 24, WhitePixel(display, screen), header_str, W - 20, XBF_CUT_END);
         XSetForeground(display, gc, 0x444444);
         XDrawLine(display, pixmap, gc, 0, top_h, W, top_h);
 
@@ -1464,8 +1473,7 @@ int main(int argc, char *argv[]) {
         XSetForeground(display, gc, 0x333333);
         XDrawLine(display, pixmap, gc, side_w, top_h, side_w, play_bottom_y); // Vertical dividing line
 
-        XSetForeground(display, gc, 0x00FF00);
-        XDrawString(display, pixmap, gc, 15, 60, "INSTRUMENT LEGEND:", 18);
+        xbf_draw(g_txt, pixmap, 15, 60, 0x00FF00, "INSTRUMENT LEGEND:");
 
         // Dynamic spacing in the list based on screen height, so it doesn't get cramped in full-screen mode.
         int y_spacing = (H - 100) / 17;
@@ -1494,26 +1502,23 @@ int main(int argc, char *argv[]) {
                 // Muted: stays visible so the mute can be seen and undone, in use or not
                 XSetForeground(display, gc, 0x442222);
                 XFillRectangle(display, pixmap, gc, 15, y_offset - 8, 10, 8);
-                XSetForeground(display, gc, aktiv[i] ? 0x777777 : 0x444444);
                 if (aktiv[i])
                     snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: [MUTED] %.10s", key_hint, i + 1, preset_name);
                 else
                     snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: [MUTED] Not used", key_hint, i + 1);
-                XDrawString(display, pixmap, gc, 35, y_offset, legend_item, strlen(legend_item));
+                xbf_draw(g_txt, pixmap, 35, y_offset, aktiv[i] ? 0x777777 : 0x444444, legend_item);
             }
             else if (!aktiv[i]) {
                 XSetForeground(display, gc, 0x333333);
                 XFillRectangle(display, pixmap, gc, 15, y_offset - 8, 10, 8);
-                XSetForeground(display, gc, 0x444444);
                 snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: Not used", key_hint, i + 1);
-                XDrawString(display, pixmap, gc, 35, y_offset, legend_item, strlen(legend_item));
+                xbf_draw(g_txt, pixmap, 35, y_offset, 0x444444, legend_item);
             }
             else {
                 XSetForeground(display, gc, hent_kanal_farve(i));
                 XFillRectangle(display, pixmap, gc, 15, y_offset - 8, 10, 8);
-                XSetForeground(display, gc, WhitePixel(display, screen));
                 snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: %.16s", key_hint, i + 1, preset_name);
-                XDrawString(display, pixmap, gc, 35, y_offset, legend_item, strlen(legend_item));
+                xbf_draw(g_txt, pixmap, 35, y_offset, WhitePixel(display, screen), legend_item);
             }
             y_offset += y_spacing;
         }
@@ -1523,19 +1528,18 @@ int main(int argc, char *argv[]) {
                 XFillRectangle(display, pixmap, gc, 0, play_bottom_y, W, bot_h);
                 XSetForeground(display, gc, 0x444444);
                 XDrawLine(display, pixmap, gc, 0, play_bottom_y, W, play_bottom_y);
-                XSetForeground(display, gc, 0xBBBBBB);
                 char help_str_fmt[128];
 				snprintf(help_str_fmt, sizeof(help_str_fmt), "[Space]:Pause [L]:Load MIDI [F]:Load SF2 [T]:Toggle View [V]:Bars [Arrows Up/Down]:Speed (%.1fx) [Q]:Quit", g_speed_modifier);
               
-                XDrawString(display, pixmap, gc, 20, H - 40, help_str_fmt, strlen(help_str_fmt));
-                XSetForeground(display, gc, 0x00FF00);char status_str[128];
+                xbf_draw_fit(g_txt, pixmap, 20, H - 40, 0xBBBBBB, help_str_fmt, W - 40, XBF_CUT_END);
+                char status_str[128];
 
 				if (!g_song.count) {
 					snprintf(status_str, sizeof(status_str), "STATUS: READY  |  Press [L] to load a MIDI file to start!");
 				} else {
 					snprintf(status_str, sizeof(status_str), "STATUS: %s  |  PLAYBACK TIME: %.2f s", g_is_paused ? "PAUSE  " : "PLAYING", graphic_time_ms / 1000.0);
 				}
-                XDrawString(display, pixmap, gc, 20, H - 20, status_str, strlen(status_str));
+                xbf_draw_fit(g_txt, pixmap, 20, H - 20, 0x00FF00, status_str, W - 40, XBF_CUT_END);
 				// Copy the entire dynamic frame to the window				
 				XCopyArea(display, pixmap, window, gc, 0, 0, W, H, 0, 0);
 #if defined(DEBUG_TIMING) && !defined(THREAD)
@@ -1575,7 +1579,7 @@ frame_done:
 	if (audio_error) fprintf(stderr, "Audio output stopped because of an error.\n");
 #endif
 
-    if (font) XFreeFont(display, font);
+    xbf_free(g_txt);
     XFreePixmap(display, pixmap);
     XFreeGC(display, gc);
     XDestroyWindow(display, window);

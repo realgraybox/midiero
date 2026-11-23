@@ -32,7 +32,9 @@
  *
  *     #define FC_DEFAULT_WIDTH   400
  *     #define FC_DEFAULT_HEIGHT  500
- *     #define FC_FONT_NAME       "fixed"
+ *     #include "fonts/xbf_fixed_10x20.h"   // text font (xbmfont); default 6x13
+ *     #define FC_FONT            xbf_fixed_10x20
+ *     #define FC_FONT_SCALE      1             // whole-number scaling
  *
  *     // Colors must be in X11 "#RRGGBB" format (e.g. "#222222").
  *     #define FC_HEADER_BG_COLOR      "#222222"

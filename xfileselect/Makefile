@@ -27,7 +27,7 @@ TARGET  = xfileselect
 TARGET1 = example_main
 
 CFLAGS += -Os -Wall -Wshadow -Wextra -Wno-deprecated-declarations -Wformat=2 \
-          --std=gnu99 -ffunction-sections -fdata-sections
+          --std=gnu99 -ffunction-sections -fdata-sections -I../xbmfont
           
 
 LDFLAGS += $(STATIC) -Wl,--gc-sections,--sort-common,-s -lX11 -lm

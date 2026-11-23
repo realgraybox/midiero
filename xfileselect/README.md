@@ -16,7 +16,6 @@ A tiny, single-file X11 file/directory chooser for C programs.
 // Optional: override visual defaults before including the implementation
 #define FC_DEFAULT_WIDTH   400
 #define FC_DEFAULT_HEIGHT  500
-#define FC_FONT_NAME       "fixed"
 
 // Include the implementation (it pulls in xfileselect.h itself)
 #include "xfileselect.c"
@@ -62,7 +61,7 @@ gcc example_main.c -o example_main -lX11
 - **Visual customization**
   - Define before `#include "xfileselect.c"`:
     - `FC_DEFAULT_WIDTH`, `FC_DEFAULT_HEIGHT`
-    - `FC_FONT_NAME`
+    - `FC_FONT`, `FC_FONT_SCALE`: the text font, an [xbmfont](https://github.com/realgraybox/xbmfont) font (default `xbf_fixed_6x13` at scale 1). Text is drawn with fonts built into the program, so it looks the same on every X server, and UTF-8 file names show right. `xbmfont.h` and its `fonts/` must be on the include path; here they come from midiero's `xbmfont/`.
     - Color strings: `FC_HEADER_BG_COLOR`, `FC_LIST_BG_COLOR`, etc. (hex like `"0x222222"` or `"#222222"`)
     - Text: `FC_DEFAULT_HELP_TEXT`
   - Header text and window title are set per call.

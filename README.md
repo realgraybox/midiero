@@ -42,6 +42,7 @@ Not related to SpyderTL/MidiHero, a Windows practice utility for isolating instr
 midiero is crafted to be completely independent of bloated desktop frameworks (like GTK or Qt) and external server-side synths. 
 
 - **Graphics & Input:** Pure X11 / Xlib
+- **Text:** [xbmfont](https://github.com/realgraybox/xbmfont) (bundled in `xbmfont/`, zlib licensed; the fonts are the public-domain X11 misc-fixed fonts): the font is built into the program, so midiero looks the same on every X server, and song and file names in UTF-8 or old 8-bit encodings show right.
 - **MIDI Parsing and Sound Synthesis:** [mmidi](https://github.com/realgraybox/mmidi) (its `v2/` engine, bundled in `mmidi/`, zlib licensed): Standard MIDI files of format 0, 1 and 2 (format 2 sequences back to back) and RIFF RMID, a SoundFont 2 synthesizer with the bank's own per-instrument reverb and chorus, built `.sf2`-only (`-DMM_NO_MODELS`). midiero reads the song's events from mmidi once and runs its own sequencer, so pause, speed and the note display work as before.
 - **Audio Output:** OSS and/or TinyALSA
 

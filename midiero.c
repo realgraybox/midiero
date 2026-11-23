@@ -44,6 +44,9 @@
 #define XBMFONT_IMPLEMENTATION
 #include "xbmfont.h"
 #include "fonts/xbf_fixed_6x13.h"	// the look of X's own "fixed" font
+#ifndef MIDIERO_SMALL_FONTS
+#include "fonts/xbf_fixed_10x20.h"	// sharper text on large screens (about 17 KB)
+#endif
 
 //xfileselect area
 #define FC_DEFAULT_WIDTH        500
@@ -707,7 +710,7 @@ static int foerste_node_fra(double t) {
 
 typedef struct {
     XRectangle bars[BATCH];		// duration bars (node mode) / blocks (hero mode)
-    XSegment   ends[BATCH];		// end marks of the duration bars
+    XRectangle ends[BATCH];		// end marks of the duration bars
     XArc       heads[BATCH];	// noteheads
     XPoint     sharps[BATCH];	// position of each '#'
     int n_bars, n_ends, n_heads, n_sharps;
@@ -715,7 +718,50 @@ typedef struct {
 
 static kanal_batch_t g_batch[16];
 static xbf_ctx* g_txt = NULL;		// text font, uploaded once to the X server
-static XSegment g_ledger_c[BATCH], g_ledger_ydre[BATCH];	// middle-C ledger / outer ledger lines
+
+// --- Size: on a large screen everything (text, panels, notes, lines) grows ---
+// The layout is designed for 800x600 with a 13 px font; U(x) is a base-size
+// measure at the current size, which is set by the text's line height.
+typedef struct { const xbf_font* font; int scale; } ui_size_t;
+static const ui_size_t g_sizes[] = {
+#ifndef MIDIERO_SMALL_FONTS
+    { &xbf_fixed_6x13, 1 }, { &xbf_fixed_10x20, 1 }, { &xbf_fixed_6x13, 2 },
+    { &xbf_fixed_10x20, 2 }, { &xbf_fixed_10x20, 3 }, { &xbf_fixed_10x20, 4 },
+#else
+    { &xbf_fixed_6x13, 1 }, { &xbf_fixed_6x13, 2 }, { &xbf_fixed_6x13, 3 },
+    { &xbf_fixed_6x13, 4 }, { &xbf_fixed_6x13, 6 },
+#endif
+};
+#define N_SIZES ((int)(sizeof g_sizes / sizeof g_sizes[0]))
+static int g_size = 0;				// index in g_sizes
+static int g_size_manual = -1;		// chosen with +/-, or -1 = follow the window size
+static int g_unit = 13;				// line height of the current size (13 = base)
+#define U(x) (((x) * g_unit + 6) / 13)
+
+// Line height of a size
+static int size_line(int i) { return g_sizes[i].font->height * g_sizes[i].scale; }
+
+// Largest size whose scaled 800x600 layout fits in the window
+static int size_for_window(int w, int h) {
+    int best = 0;
+    for (int i = 1; i < N_SIZES; i++)
+        if (size_line(i) * 800 <= w * 13 && size_line(i) * 600 <= h * 13) best = i;
+    return best;
+}
+
+// Switch to size i: upload its font (only when it changes). False if X refused.
+static bool set_size(Display* d, Drawable like, int i) {
+    if (g_txt && i == g_size) return true;
+    xbf_ctx* t = xbf_create(d, like, g_sizes[i].font, g_sizes[i].scale);
+    if (!t) return g_txt != NULL;	// keep the current size
+    xbf_free(g_txt);
+    g_txt = t;
+    g_size = i;
+    g_unit = size_line(i);
+    x11_filechooser_font(g_sizes[i].font, g_sizes[i].scale);	// dialogs match
+    return true;
+}
+static XRectangle g_ledger_c[BATCH], g_ledger_ydre[BATCH];	// middle-C ledger / outer ledger lines
 static int g_n_ledger_c = 0, g_n_ledger_ydre = 0;
 
 // Send everything collected so far, layer by layer, and empty the batches
@@ -725,7 +771,7 @@ static void tegn_batches(Display* d, Drawable p, GC gc) {
         if (!b->n_bars && !b->n_ends) continue;
         XSetForeground(d, gc, hent_kanal_farve(ch));
         if (b->n_bars) XFillRectangles(d, p, gc, b->bars, b->n_bars);
-        if (b->n_ends) XDrawSegments(d, p, gc, b->ends, b->n_ends);
+        if (b->n_ends) XFillRectangles(d, p, gc, b->ends, b->n_ends);
         b->n_bars = b->n_ends = 0;
     }
     for (int ch = 0; ch < 16; ch++) {				// 2. noteheads and sharps
@@ -739,12 +785,12 @@ static void tegn_batches(Display* d, Drawable p, GC gc) {
     }
     if (g_n_ledger_c) {								// 3. ledger lines
         XSetForeground(d, gc, 0x666666);
-        XDrawSegments(d, p, gc, g_ledger_c, g_n_ledger_c);
+        XFillRectangles(d, p, gc, g_ledger_c, g_n_ledger_c);
         g_n_ledger_c = 0;
     }
     if (g_n_ledger_ydre) {
         XSetForeground(d, gc, 0x444444);
-        XDrawSegments(d, p, gc, g_ledger_ydre, g_n_ledger_ydre);
+        XFillRectangles(d, p, gc, g_ledger_ydre, g_n_ledger_ydre);
         g_n_ledger_ydre = 0;
     }
 }
@@ -757,11 +803,12 @@ static kanal_batch_t* batch_til(Display* d, Drawable p, GC gc, int ch) {
     return b;
 }
 
-static void tilfoej_ledger(Display* d, Drawable p, GC gc, bool midter_c, int x1, int x2, int y) {
+// Horizontal line from x1 to x2 (both included) at y, lw pixels thick
+static void tilfoej_ledger(Display* d, Drawable p, GC gc, bool midter_c, int x1, int x2, int y, int lw) {
     if (g_n_ledger_c >= BATCH || g_n_ledger_ydre >= BATCH) tegn_batches(d, p, gc);
-    XSegment* sg = midter_c ? &g_ledger_c[g_n_ledger_c++] : &g_ledger_ydre[g_n_ledger_ydre++];
-    sg->x1 = (short)x1; sg->x2 = (short)x2;
-    sg->y1 = sg->y2 = (short)y;
+    XRectangle* r = midter_c ? &g_ledger_c[g_n_ledger_c++] : &g_ledger_ydre[g_n_ledger_ydre++];
+    r->x = (short)x1; r->y = (short)(y - lw / 2);
+    r->width = (unsigned short)(x2 - x1 + 1); r->height = (unsigned short)lw;
 }
 
 // Function to load a MIDI file (format 0, 1 or 2, also RIFF RMID) into *ny_song.
@@ -997,8 +1044,7 @@ int main(int argc, char *argv[]) {
     GC gc = XCreateGC(display, window, 0, NULL);
     Pixmap pixmap = XCreatePixmap(display, window, WINDOW_WIDTH, WINDOW_HEIGHT, DefaultDepth(display, screen));
 
-    g_txt = xbf_create(display, window, &xbf_fixed_6x13, 1);
-    if (!g_txt) {
+    if (!set_size(display, window, 0)) {
         fprintf(stderr, "Could not upload the font to the X server\n");
         return 1;
     }
@@ -1081,6 +1127,15 @@ int main(int argc, char *argv[]) {
                     g_speed_modifier -= 0.1;
                     if (g_speed_modifier < 0.1) g_speed_modifier = 0.1;
 #endif
+				}
+				else if (keysym == XK_plus || keysym == XK_equal || keysym == XK_KP_Add) {
+					g_size_manual = g_size < N_SIZES - 1 ? g_size + 1 : g_size;	// bigger
+				}
+				else if (keysym == XK_minus || keysym == XK_KP_Subtract) {
+					g_size_manual = g_size > 0 ? g_size - 1 : 0;				// smaller
+				}
+				else if (keysym == XK_a || keysym == XK_A) {
+					g_size_manual = -1;											// follow the window again
 				}
 				else if (keysym == XK_t || keysym == XK_T) {
 					g_node_mode = !g_node_mode; // Switch between Hero and Node view!
@@ -1303,15 +1358,22 @@ int main(int argc, char *argv[]) {
             last_w = W; last_h = H;
         }
 
+        // Size: from the window, unless chosen with +/-
+        set_size(display, window, g_size_manual >= 0 ? g_size_manual : size_for_window(W, H));
+
         // Clear the screen (Pixmap)
         XSetForeground(display, gc, BlackPixel(display, screen));
         XFillRectangle(display, pixmap, gc, 0, 0, W, H);
         
 
         // Define the dynamic layout zones based on the current screen size.
-        int top_h = 40;       // Height of top beam
-        int bot_h = 60;       // Height of bottom beam
-        int side_w = 240;     // Side panel width (Legend)
+        // U(x): a measure of the 800x600 design at the current size.
+        int lw = U(1);          // line width
+        int base_h = H * 13 / g_unit;	// window height in base-size pixels
+        double px_ms = g_unit / 130.0;	// time axis: 0.1 px per ms at base size
+        int top_h = U(40);      // Height of top beam
+        int bot_h = U(60);      // Height of bottom beam
+        int side_w = U(240);    // Side panel width (Legend)
         int play_x_start = side_w; // The playing area starts where the side panel ends.
         int play_w = W - side_w;   // The rest of the screen is used for sheet music.
         
@@ -1325,15 +1387,16 @@ int main(int argc, char *argv[]) {
         XFillRectangle(display, pixmap, gc, 0, 0, W, top_h);
         char header_str[600]; // room for both 256-char names
 
-		snprintf(header_str, sizeof(header_str), "  Midiero :: File: %s :: Bank: %s :: Resolution: %dx%d", g_nuvaerende_midi_navn, g_nuvaerende_sf2_navn, W, H);
+		snprintf(header_str, sizeof(header_str), "  Midiero :: File: %s :: Bank: %s :: Resolution: %dx%d :: Size: %d%s", g_nuvaerende_midi_navn, g_nuvaerende_sf2_navn, W, H, g_size + 1, g_size_manual >= 0 ? "" : " (auto)");
         
-        xbf_draw_fit(g_txt, pixmap, 10, 24, WhitePixel(display, screen), header_str, W - 20, XBF_CUT_END);
+        xbf_draw_fit(g_txt, pixmap, U(10), (top_h - xbf_line_height(g_txt)) / 2 + xbf_ascent(g_txt),
+                     WhitePixel(display, screen), header_str, W - U(20), XBF_CUT_END);
         XSetForeground(display, gc, 0x444444);
-        XDrawLine(display, pixmap, gc, 0, top_h, W, top_h);
+        XFillRectangle(display, pixmap, gc, 0, top_h, W, lw);
 
 		// --- ZONE 2: INTELLIGENT PLAYING SURFACE (Now vertically scalable) ---
         int center_y = top_h + (play_bottom_y - top_h) / 2; // The vertical center is adjusted automatically.
-        int linje_afstand = (H > 700) ? 14 : 10;            // Increase the line spacing if the screen is large!
+        int linje_afstand = U(base_h > 700 ? 14 : 10);      // Increase the line spacing if the screen is large!
 
         if (g_node_mode) {
             // Draw the staff lines (G and F clefs).
@@ -1342,34 +1405,34 @@ int main(int argc, char *argv[]) {
             for (int l = 0; l < 5; l++) {
                 int y_linje = center_y - (g_trin[l] * linje_afstand / 2);
                 if (y_linje > top_h && y_linje < play_bottom_y) {
-                    XDrawLine(display, pixmap, gc, play_x_start, y_linje, W, y_linje);
+                    XFillRectangle(display, pixmap, gc, play_x_start, y_linje - lw / 2, W - play_x_start, lw);
                 }
             }
             int f_trin[] = {-12, -10, -8, -6, -4};
             for (int l = 0; l < 5; l++) {
                 int y_linje = center_y - (f_trin[l] * linje_afstand / 2);
                 if (y_linje > top_h && y_linje < play_bottom_y) {
-                    XDrawLine(display, pixmap, gc, play_x_start, y_linje, W, y_linje);
+                    XFillRectangle(display, pixmap, gc, play_x_start, y_linje - lw / 2, W - play_x_start, lw);
                 }
             }
 
             // Red "NOW" playhead
             XSetForeground(display, gc, 0xFF0000); 
-            XDrawLine(display, pixmap, gc, dynamic_center_x, top_h, dynamic_center_x, play_bottom_y);
+            XFillRectangle(display, pixmap, gc, dynamic_center_x - lw / 2, top_h, lw, play_bottom_y - top_h + 1);
 
             // Define the dimensions of the node head first (so they are known for the calculation).
-            int node_w = (H > 700) ? 18 : 14;
-            int node_h = (H > 700) ? 10 : 8;
+            int node_w = U(base_h > 700 ? 18 : 14);
+            int node_h = U(base_h > 700 ? 10 : 8);
 
 			// Only notes that can be on screen: the first candidate is found by binary
 			// search (notes are sorted by start time); the loop stops at the right edge.
 			// With bars on, a note that started up to g_max_node_ms earlier can still show.
-			double venstre_ms = (dynamic_center_x - play_x_start + 40) / 0.1;
+			double venstre_ms = (dynamic_center_x - play_x_start + U(40)) / px_ms;
 			double t_min = graphic_time_ms - venstre_ms - (g_show_bars ? g_max_node_ms : 0.0);
 
 			for (int i = foerste_node_fra(t_min); i < g_node_antal; i++) {
 				const node_t* n = &g_noder[i];
-				int x_pos = dynamic_center_x + (int)((n->start_ms - graphic_time_ms) * 0.1);
+				int x_pos = dynamic_center_x + (int)((n->start_ms - graphic_time_ms) * px_ms);
 				if (x_pos >= W) break; // all later notes start even further right
 				if (!g_channels_enabled[n->channel]) continue;
 
@@ -1378,9 +1441,9 @@ int main(int argc, char *argv[]) {
 				if (y_pos <= top_h || y_pos >= play_bottom_y) continue;
 
 				// --- DURATION OF THE NOTE (LENGTH OF THE BEAM) ---
-				int node_laengde_pixels = 16; // Standard minimum width (head only)
+				int node_laengde_pixels = U(16); // Standard minimum width (head only)
 				if (g_show_bars && n->end_ms >= 0.0) {
-					node_laengde_pixels = (int)((n->end_ms - n->start_ms) * 0.1); // 1ms = 0.1px
+					node_laengde_pixels = (int)((n->end_ms - n->start_ms) * px_ms); // 1ms = 0.1px at base size
 					if (node_laengde_pixels < node_w) node_laengde_pixels = node_w;
 				}
 
@@ -1397,23 +1460,23 @@ int main(int argc, char *argv[]) {
 				if (g_show_bars && node_laengde_pixels > node_w) {
 					int bx1 = x_pos + (node_w / 2);
 					int bx2 = x_ende;
-					if (bx1 < play_x_start - 10) bx1 = play_x_start - 10;
-					if (bx2 > W + 10) bx2 = W + 10;
+					if (bx1 < play_x_start - U(10)) bx1 = play_x_start - U(10);
+					if (bx2 > W + U(10)) bx2 = W + U(10);
 					if (bx2 > bx1) {
 						XRectangle* r = &b->bars[b->n_bars++];
-						r->x = (short)bx1; r->y = (short)(y_pos - 2);
-						r->width = (unsigned short)(bx2 - bx1); r->height = 4;
+						r->x = (short)bx1; r->y = (short)(y_pos - U(2));
+						r->width = (unsigned short)(bx2 - bx1); r->height = (unsigned short)U(4);
 					}
 					// A small vertical end line at the end of the beam.
-					if (x_ende < W + 10) {
-						XSegment* e = &b->ends[b->n_ends++];
-						e->x1 = e->x2 = (short)x_ende;
-						e->y1 = (short)(y_pos - 4); e->y2 = (short)(y_pos + 4);
+					if (x_ende < W + U(10)) {
+						XRectangle* e = &b->ends[b->n_ends++];
+						e->x = (short)(x_ende - lw / 2); e->width = (unsigned short)lw;
+						e->y = (short)(y_pos - U(4)); e->height = (unsigned short)(2 * U(4) + 1);
 					}
 				}
 
 				// Head, sharp and ledger lines: skip if hidden behind the legend panel
-				if (x_pos + node_w + 10 < play_x_start) continue;
+				if (x_pos + node_w + U(10) < play_x_start) continue;
 
 				// 2. The round notehead itself (drawn after the bars of its channel)
 				XArc* a = &b->heads[b->n_heads++];
@@ -1424,12 +1487,12 @@ int main(int argc, char *argv[]) {
 				// 3. Sharps (#) and ledger lines
 				if (er_sort_tangent(n->key)) {
 					XPoint* sp = &b->sharps[b->n_sharps++];
-					sp->x = (short)(x_pos - 8); sp->y = (short)(y_pos + 4);
+					sp->x = (short)(x_pos - U(8)); sp->y = (short)(y_pos + U(4));
 				}
 				if (n->key == 60 || n->key == 61)
-					tilfoej_ledger(display, pixmap, gc, true, x_pos - 4, x_pos + node_w + 4, y_pos);
+					tilfoej_ledger(display, pixmap, gc, true, x_pos - U(4), x_pos + node_w + U(4), y_pos, lw);
 				if ((trin >= 12 || trin <= -14) && trin % 2 == 0)
-					tilfoej_ledger(display, pixmap, gc, false, x_pos - 3, x_pos + node_w + 3, y_pos);
+					tilfoej_ledger(display, pixmap, gc, false, x_pos - U(3), x_pos + node_w + U(3), y_pos, lw);
 			}
 
 			// Send the batches: bars, then heads and sharps, then ledger lines
@@ -1440,16 +1503,16 @@ int main(int argc, char *argv[]) {
             int grid_step = (play_bottom_y - top_h) / 15;
             if (grid_step < 1) grid_step = 1; // window very small: avoid an endless loop
             for (int i = top_h + grid_step; i < play_bottom_y; i += grid_step) {
-                XDrawLine(display, pixmap, gc, play_x_start, i, W, i);
+                XFillRectangle(display, pixmap, gc, play_x_start, i - lw / 2, W - play_x_start, lw);
             }
 
             XSetForeground(display, gc, 0xFF0000); 
-            XDrawLine(display, pixmap, gc, dynamic_center_x, top_h, dynamic_center_x, play_bottom_y);
+            XFillRectangle(display, pixmap, gc, dynamic_center_x - lw / 2, top_h, lw, play_bottom_y - top_h + 1);
 
-            double venstre_ms = (dynamic_center_x - play_x_start + 40) / 0.1;
+            double venstre_ms = (dynamic_center_x - play_x_start + U(40)) / px_ms;
             for (int i = foerste_node_fra(graphic_time_ms - venstre_ms); i < g_node_antal; i++) {
                 const node_t* n = &g_noder[i];
-                int x_pos = dynamic_center_x + (int)((n->start_ms - graphic_time_ms) * 0.1);
+                int x_pos = dynamic_center_x + (int)((n->start_ms - graphic_time_ms) * px_ms);
                 if (x_pos >= W) break; // all later notes start even further right
                 if (x_pos <= play_x_start || !g_channels_enabled[n->channel]) continue;
 
@@ -1457,12 +1520,13 @@ int main(int argc, char *argv[]) {
                 float pct = (float)(n->key - 30) / 60.0f; // assume a range of 60 notes
                 if (pct < 0.0f) pct = 0.0f;
                 if (pct > 1.0f) pct = 1.0f;
-                int y_pos = play_bottom_y - (int)(pct * (play_bottom_y - top_h - 20)) - 10;
+                int y_pos = play_bottom_y - (int)(pct * (play_bottom_y - top_h - U(20))) - U(10);
                 if (y_pos <= top_h || y_pos >= play_bottom_y) continue;
 
                 kanal_batch_t* b = batch_til(display, pixmap, gc, n->channel);
                 XRectangle* r = &b->bars[b->n_bars++];
-                r->x = (short)x_pos; r->y = (short)(y_pos - 6); r->width = 16; r->height = 12;
+                r->x = (short)x_pos; r->y = (short)(y_pos - U(6));
+                r->width = (unsigned short)U(16); r->height = (unsigned short)U(12);
             }
             tegn_batches(display, pixmap, gc);
         }
@@ -1471,14 +1535,14 @@ int main(int argc, char *argv[]) {
         XSetForeground(display, gc, 0x151515); 
         XFillRectangle(display, pixmap, gc, 0, top_h, side_w, play_bottom_y - top_h);
         XSetForeground(display, gc, 0x333333);
-        XDrawLine(display, pixmap, gc, side_w, top_h, side_w, play_bottom_y); // Vertical dividing line
+        XFillRectangle(display, pixmap, gc, side_w, top_h, lw, play_bottom_y - top_h + 1); // Vertical dividing line
 
-        xbf_draw(g_txt, pixmap, 15, 60, 0x00FF00, "INSTRUMENT LEGEND:");
+        xbf_draw(g_txt, pixmap, U(15), top_h + U(20), 0x00FF00, "INSTRUMENT LEGEND:");
 
         // Dynamic spacing in the list based on screen height, so it doesn't get cramped in full-screen mode.
-        int y_spacing = (H - 100) / 17;
-        if (y_spacing > 30) y_spacing = 30; // Maximum distance for the sake of appearance
-        int y_offset = 85;
+        int y_spacing = (H - U(100)) / 17;
+        if (y_spacing > U(30)) y_spacing = U(30); // Maximum distance for the sake of appearance
+        int y_offset = top_h + U(45);
 
         // The instrument stretch each channel is in at the song position being heard
         // (the latest started one if two overlap); NULL = the channel is not used now
@@ -1501,24 +1565,24 @@ int main(int argc, char *argv[]) {
             if (!g_channels_enabled[i]) {
                 // Muted: stays visible so the mute can be seen and undone, in use or not
                 XSetForeground(display, gc, 0x442222);
-                XFillRectangle(display, pixmap, gc, 15, y_offset - 8, 10, 8);
+                XFillRectangle(display, pixmap, gc, U(15), y_offset - U(8), U(10), U(8));
                 if (aktiv[i])
                     snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: [MUTED] %.10s", key_hint, i + 1, preset_name);
                 else
                     snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: [MUTED] Not used", key_hint, i + 1);
-                xbf_draw(g_txt, pixmap, 35, y_offset, aktiv[i] ? 0x777777 : 0x444444, legend_item);
+                xbf_draw(g_txt, pixmap, U(35), y_offset, aktiv[i] ? 0x777777 : 0x444444, legend_item);
             }
             else if (!aktiv[i]) {
                 XSetForeground(display, gc, 0x333333);
-                XFillRectangle(display, pixmap, gc, 15, y_offset - 8, 10, 8);
+                XFillRectangle(display, pixmap, gc, U(15), y_offset - U(8), U(10), U(8));
                 snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: Not used", key_hint, i + 1);
-                xbf_draw(g_txt, pixmap, 35, y_offset, 0x444444, legend_item);
+                xbf_draw(g_txt, pixmap, U(35), y_offset, 0x444444, legend_item);
             }
             else {
                 XSetForeground(display, gc, hent_kanal_farve(i));
-                XFillRectangle(display, pixmap, gc, 15, y_offset - 8, 10, 8);
+                XFillRectangle(display, pixmap, gc, U(15), y_offset - U(8), U(10), U(8));
                 snprintf(legend_item, sizeof(legend_item), "[%s] Ch%02d: %.16s", key_hint, i + 1, preset_name);
-                xbf_draw(g_txt, pixmap, 35, y_offset, WhitePixel(display, screen), legend_item);
+                xbf_draw(g_txt, pixmap, U(35), y_offset, WhitePixel(display, screen), legend_item);
             }
             y_offset += y_spacing;
         }
@@ -1527,11 +1591,11 @@ int main(int argc, char *argv[]) {
                 XSetForeground(display, gc, 0x111111);
                 XFillRectangle(display, pixmap, gc, 0, play_bottom_y, W, bot_h);
                 XSetForeground(display, gc, 0x444444);
-                XDrawLine(display, pixmap, gc, 0, play_bottom_y, W, play_bottom_y);
+                XFillRectangle(display, pixmap, gc, 0, play_bottom_y, W, lw);
                 char help_str_fmt[128];
-				snprintf(help_str_fmt, sizeof(help_str_fmt), "[Space]:Pause [L]:Load MIDI [F]:Load SF2 [T]:Toggle View [V]:Bars [Arrows Up/Down]:Speed (%.1fx) [Q]:Quit", g_speed_modifier);
+				snprintf(help_str_fmt, sizeof(help_str_fmt), "[Space]:Pause [L]:Load MIDI [F]:Load SF2 [T]:Toggle View [V]:Bars [Arrows Up/Down]:Speed (%.1fx) [+/-]:Size [A]:Auto [Q]:Quit", g_speed_modifier);
               
-                xbf_draw_fit(g_txt, pixmap, 20, H - 40, 0xBBBBBB, help_str_fmt, W - 40, XBF_CUT_END);
+                xbf_draw_fit(g_txt, pixmap, U(20), H - U(40), 0xBBBBBB, help_str_fmt, W - U(40), XBF_CUT_END);
                 char status_str[128];
 
 				if (!g_song.count) {
@@ -1539,7 +1603,7 @@ int main(int argc, char *argv[]) {
 				} else {
 					snprintf(status_str, sizeof(status_str), "STATUS: %s  |  PLAYBACK TIME: %.2f s", g_is_paused ? "PAUSE  " : "PLAYING", graphic_time_ms / 1000.0);
 				}
-                xbf_draw_fit(g_txt, pixmap, 20, H - 20, 0x00FF00, status_str, W - 40, XBF_CUT_END);
+                xbf_draw_fit(g_txt, pixmap, U(20), H - U(20), 0x00FF00, status_str, W - U(40), XBF_CUT_END);
 				// Copy the entire dynamic frame to the window				
 				XCopyArea(display, pixmap, window, gc, 0, 0, W, H, 0, 0);
 #if defined(DEBUG_TIMING) && !defined(THREAD)

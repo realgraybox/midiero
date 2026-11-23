@@ -59,6 +59,8 @@
  *   Using "0xRRGGBB" or other formats is not supported.
  */
 
+#include "xbmfont.h"
+
 typedef enum {
     FC_MODE_FILE,
     FC_MODE_DIR
@@ -87,6 +89,13 @@ char *x11_filechooser(const char *start_path,
                       const char *filter_ext,
                       FCMode mode,
                       const char *help_text);
+
+/*
+ * Font for the dialogs opened from now on, e.g. to match the program's own
+ * text size on a large screen; NULL = the compiled-in FC_FONT. The window
+ * size, paddings and columns grow in step with the font's line height.
+ */
+void x11_filechooser_font(const xbf_font *font, int scale);
 
 
 #endif // XFILESELECT_H

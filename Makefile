@@ -53,6 +53,11 @@ endif
 
 LDFLAGS += $(STATIC) -Wl,--gc-sections,--sort-common,-s -lX11 -lm
 
+# make SMALL_FONTS=1 : only the 6x13 font (scaled on large screens), about 17 KB smaller
+ifeq ($(SMALL_FONTS),1)
+CFLAGS += -DMIDIERO_SMALL_FONTS
+endif
+
 THREAD ?= 0
 ifeq ($(THREAD),1)
 CFLAGS  += -DTHREAD

@@ -74,6 +74,14 @@ static char *fc_strdup(const char *s)  {
 #define FC_FONT_SCALE           1
 #endif
 
+// Font for the next dialog (x11_filechooser_font); NULL = FC_FONT
+static const xbf_font *fc_font = NULL;
+static int fc_font_scale = FC_FONT_SCALE;
+
+// Sizes below (FC_DEFAULT_WIDTH, paddings, text positions ...) are for a
+// 13 px font such as 6x13; they grow in step with a bigger font.
+#define FCU(fc, x) (((x) * (fc)->unit + 6) / 13)
+
 // Colors (as hex strings for parsing)
 #ifndef FC_HEADER_BG_COLOR
 #define FC_HEADER_BG_COLOR      "#222222"
@@ -149,6 +157,7 @@ typedef struct {
     int width;
     int height;
     int line_height;
+    int unit;               // text line height without spacing (13 = base size)
 
     char cwd[4096];
     char *files[MAX_FILES];
@@ -277,8 +286,12 @@ static int fc_init(FCContext *fc, const char *start_path,
 
     int screen = DefaultScreen(fc->dpy);
 
-    fc->width  = FC_DEFAULT_WIDTH;
-    fc->height = FC_DEFAULT_HEIGHT;
+    {
+        const xbf_font *f = fc_font ? fc_font : &FC_FONT;
+        fc->unit = f->height * (fc_font ? fc_font_scale : FC_FONT_SCALE);
+    }
+    fc->width  = FCU(fc, FC_DEFAULT_WIDTH);
+    fc->height = FCU(fc, FC_DEFAULT_HEIGHT);
 
     fc->win = XCreateSimpleWindow(fc->dpy,
                                   RootWindow(fc->dpy, screen),
@@ -350,7 +363,8 @@ static int fc_init(FCContext *fc, const char *start_path,
                              
     XMapWindow(fc->dpy, fc->win);
 
-    fc->txt = xbf_create(fc->dpy, fc->win, &FC_FONT, FC_FONT_SCALE);
+    fc->txt = fc_font ? xbf_create(fc->dpy, fc->win, fc_font, fc_font_scale)
+                      : xbf_create(fc->dpy, fc->win, &FC_FONT, FC_FONT_SCALE);
     if (!fc->txt) {
         fprintf(stderr, "xfileselect: could not upload the font\n");
         XFreeGC(fc->dpy, fc->gc);
@@ -358,7 +372,7 @@ static int fc_init(FCContext *fc, const char *start_path,
         XCloseDisplay(fc->dpy);
         return -1;
     }
-    fc->line_height = xbf_line_height(fc->txt) + 2;
+    fc->line_height = xbf_line_height(fc->txt) + FCU(fc, 2);
 
     if (filter_ext) {
         strncpy(fc->filter_list, filter_ext, sizeof(fc->filter_list) - 1);
@@ -461,9 +475,9 @@ static void fc_draw(FCContext *fc) {
 
     int line_height = fc->line_height;
     int header_height = (fc->header_text[0] != '\0')
-                      ? (line_height + FC_HEADER_PADDING_Y)
+                      ? (line_height + FCU(fc, FC_HEADER_PADDING_Y))
                       : 0;
-    int status_line_height = line_height + FC_STATUS_PADDING_Y;
+    int status_line_height = line_height + FCU(fc, FC_STATUS_PADDING_Y);
 
     int usable_height = fc->height - status_line_height - header_height;
 
@@ -492,8 +506,8 @@ static void fc_draw(FCContext *fc) {
         XSetForeground(fc->dpy, fc->gc, fc->header_bg);
         XFillRectangle(fc->dpy, d, fc->gc,
                        0, 0, fc->width, header_height);
-        xbf_draw_fit(fc->txt, d, 10, line_height + 2, fc->header_fg,
-                     fc->header_text, fc->width - 20, XBF_CUT_END);
+        xbf_draw_fit(fc->txt, d, FCU(fc, 10), line_height + FCU(fc, 2), fc->header_fg,
+                     fc->header_text, fc->width - FCU(fc, 20), XBF_CUT_END);
 
         // Separator between header and file area
         XSetForeground(fc->dpy, fc->gc, sep_color);
@@ -514,7 +528,7 @@ static void fc_draw(FCContext *fc) {
         if (file_index == fc->selected) {
             XSetForeground(fc->dpy, fc->gc, fc->list_sel_bg);
             XFillRectangle(fc->dpy, d, fc->gc,
-                           0, y - line_height + 2, fc->width, line_height);
+                           0, y - line_height + FCU(fc, 2), fc->width, line_height);
             fg = fc->list_sel_fg;
         } else {
             fg = fc->list_fg;
@@ -536,11 +550,11 @@ static void fc_draw(FCContext *fc) {
         }
 
         // A long name is shortened in the middle, so its extension stays visible
-        xbf_draw_fit(fc->txt, d, FC_FILE_TEXT_X, y, fg, fc->files[file_index],
-                     FC_INFO_TEXT_X - FC_FILE_TEXT_X - xbf_char_width(fc->txt),
+        xbf_draw_fit(fc->txt, d, FCU(fc, FC_FILE_TEXT_X), y, fg, fc->files[file_index],
+                     FCU(fc, FC_INFO_TEXT_X - FC_FILE_TEXT_X) - xbf_char_width(fc->txt),
                      XBF_CUT_MIDDLE);
-        xbf_draw_fit(fc->txt, d, FC_INFO_TEXT_X, y, fg, info,
-                     fc->width - FC_INFO_TEXT_X - 4, XBF_CUT_END);
+        xbf_draw_fit(fc->txt, d, FCU(fc, FC_INFO_TEXT_X), y, fg, info,
+                     fc->width - FCU(fc, FC_INFO_TEXT_X + 4), XBF_CUT_END);
     }
     
     // Separator between file area and status
@@ -553,8 +567,8 @@ static void fc_draw(FCContext *fc) {
     XSetForeground(fc->dpy, fc->gc, fc->status_bg);
     XFillRectangle(fc->dpy, d, fc->gc,
                    0, status_y, fc->width, status_line_height);
-    xbf_draw_fit(fc->txt, d, 10, fc->height - 6, fc->status_fg,
-                 fc->help_text, fc->width - 20, XBF_CUT_END);
+    xbf_draw_fit(fc->txt, d, FCU(fc, 10), fc->height - FCU(fc, 6), fc->status_fg,
+                 fc->help_text, fc->width - FCU(fc, 20), XBF_CUT_END);
                 
     // Finally copy to window
     XCopyArea(fc->dpy, d, fc->win, fc->gc,
@@ -626,9 +640,9 @@ static void fc_handle_key(FCContext *fc, XKeyEvent *ev) {
 static void fc_handle_click(FCContext *fc, XButtonEvent *ev) {
     int line_height = fc->line_height;
     int header_height = (fc->header_text[0] != '\0')
-                      ? (line_height + FC_HEADER_PADDING_Y)
+                      ? (line_height + FCU(fc, FC_HEADER_PADDING_Y))
                       : 0;
-    int status_line_height = line_height + FC_STATUS_PADDING_Y;
+    int status_line_height = line_height + FCU(fc, FC_STATUS_PADDING_Y);
 
     int list_y_start = header_height;
     int usable_height = fc->height - status_line_height - header_height;
@@ -713,9 +727,9 @@ static void fc_run(FCContext *fc) {
             } else if (ev.xbutton.button == Button5) {
                 int line_height = fc->line_height;
                 int header_height = (fc->header_text[0] != '\0')
-                                  ? (line_height + FC_HEADER_PADDING_Y)
+                                  ? (line_height + FCU(fc, FC_HEADER_PADDING_Y))
                                   : 0;
-                int status_line_height = line_height + FC_STATUS_PADDING_Y;
+                int status_line_height = line_height + FCU(fc, FC_STATUS_PADDING_Y);
                 int usable_height = fc->height - status_line_height - header_height;
                 int rows = usable_height / line_height;
 
@@ -738,9 +752,9 @@ static void fc_run(FCContext *fc) {
 
             int line_height = fc->line_height;
             int header_height = (fc->header_text[0] != '\0')
-                              ? (line_height + FC_HEADER_PADDING_Y)
+                              ? (line_height + FCU(fc, FC_HEADER_PADDING_Y))
                               : 0;
-            int status_line_height = line_height + FC_STATUS_PADDING_Y;
+            int status_line_height = line_height + FCU(fc, FC_STATUS_PADDING_Y);
             int usable_height = fc->height - status_line_height - header_height;
             int rows = usable_height / line_height;
 
@@ -770,6 +784,12 @@ static void fc_cleanup(FCContext *fc) {
 }
 
 // Public API
+void x11_filechooser_font(const xbf_font *font, int scale)
+{
+    fc_font = font;
+    fc_font_scale = scale < 1 ? 1 : scale;
+}
+
 char *x11_filechooser(const char *start_path,
                       const char *title,
                       const char *header_text,

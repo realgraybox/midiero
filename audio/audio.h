@@ -46,6 +46,12 @@ int  audio_write(const int16_t *pcm, int samples);
  * the backend cannot tell. Coarse on many drivers (updated per fragment).
  */
 int  audio_queued_frames(void);
+/*
+ * Size of the device's fragment (OSS) in frames, or 0 if unknown/not used.
+ * audio_queued_frames() can be up to this much too high, so keep at least
+ * this much more queued than the latency you aim for.
+ */
+int  audio_fragment_frames(void);
 void audio_close(void);
 
 enum audio_backend audio_get_backend(void);

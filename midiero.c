@@ -76,6 +76,15 @@
 #define CHUNK_FRAMES		256		//~5.3 ms at 48 kHz
 #define TARGET_QUEUE_MS		70
 #define TARGET_QUEUE_FRAMES	(SAMPLE_RATE * TARGET_QUEUE_MS / 1000)
+// An OSS driver may report up to one fragment more than is really queued (see
+// audio_fragment_frames), so that much is added. Normally a few ms; with drivers
+// that pick huge fragments (seen: 512 ms) this keeps the sound card fed.
+#define QUEUE_TARGET()		(TARGET_QUEUE_FRAMES + audio_fragment_frames())
+#else
+// Threaded build: the audio thread is paced by its blocking writes. A driver with
+// a huge buffer (seen: 16 s) would let it run seconds ahead, so pause and speed
+// changes would be heard late; it waits while more than this is queued.
+#define THREAD_QUEUE_MAX()	(4 * BUFFER_SIZE + 2 * audio_fragment_frames())
 #endif
 
 #include <math.h>
@@ -364,8 +373,9 @@ static void dbg_loop_end(double now, int queued_now, bool paused_now) {
     if (g_dbg_t0 < 0.0) g_dbg_t0 = now;
     if (!paused_now && g_dbg_play < 0.0) {
         g_dbg_play = now;
-        fprintf(stderr, "[%8.3f s] ---- playback started, queue %.1f ms (target %d ms)\n",
-                (now - g_dbg_t0) / 1000.0, dbg_frames_ms(queued_now), TARGET_QUEUE_MS);
+        fprintf(stderr, "[%8.3f s] ---- playback started, queue %.1f ms (target %.1f ms = %d + fragment %.1f)\n",
+                (now - g_dbg_t0) / 1000.0, dbg_frames_ms(queued_now), dbg_frames_ms(QUEUE_TARGET()),
+                TARGET_QUEUE_MS, dbg_frames_ms(audio_fragment_frames()));
     } else if (paused_now) {
         g_dbg_play = -1.0;
     }
@@ -913,6 +923,10 @@ static void *audio_thread(void *arg) {
     short sample_buffer[BUFFER_SIZE * 2];
 
     while (running) {
+        // Normally the blocking write paces this loop; see THREAD_QUEUE_MAX
+        while (running && playback_queued_frames() > THREAD_QUEUE_MAX())
+            usleep(2000);
+
         pthread_mutex_lock(&audio_mutex);
 
         double chunk_song_start = g_time_ms; //song time covered by this chunk (for the clock)
@@ -1256,8 +1270,9 @@ int main(int argc, char *argv[]) {
         // Only writes while there is room, so the loop does not wait for the sound card
         // and can draw at TARGET_FPS.
         double chunk_time_ms = ((double)CHUNK_FRAMES / SAMPLE_RATE) * 1000.0;
-        for (int n = 0; running && n < TARGET_QUEUE_FRAMES / CHUNK_FRAMES + 4; n++) {
-            if (playback_queued_frames() >= TARGET_QUEUE_FRAMES) break;
+        int queue_target = QUEUE_TARGET();
+        for (int n = 0; running && n < queue_target / CHUNK_FRAMES + 4; n++) {
+            if (playback_queued_frames() >= queue_target) break;
 
             // Pause and go back to start
             if (g_song.count && g_current_ev >= g_song.count && mm_active_voices(g_synth) == 0) {

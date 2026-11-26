@@ -48,6 +48,19 @@ static int audio_channels;
 
 #ifdef AUDIO_HAVE_OSS
 static int oss_fd = -1;
+static int oss_frag_bytes = 0;      /* fragment size the driver uses (0 = unknown) */
+static long long oss_written = 0;   /* bytes written since the device was set up */
+
+/*
+ * Fragments to ask the OSS driver for: 0xMMMMSSSS = MMMM fragments of 2^SSSS
+ * bytes. 16 x 4096 bytes is 16 x 21 ms at 48 kHz stereo. Some drivers choose
+ * huge fragments by themselves (seen: 32 x 512 ms) and only count a fragment
+ * as queued once it is full, which makes the queue report useless for timing.
+ * It is only a request; drivers may round it or ignore it.
+ */
+#ifndef AUDIO_OSS_FRAGMENT
+#define AUDIO_OSS_FRAGMENT 0x0010000C
+#endif
 #endif
 
 #ifdef AUDIO_HAVE_TINYALSA
@@ -127,6 +140,14 @@ int audio_write(const int16_t *pcm, int frames) {
     }
 }
 
+int audio_fragment_frames(void) {
+#ifdef AUDIO_HAVE_OSS
+    if (current_backend == AUDIO_BACKEND_OSS && audio_channels > 0)
+        return oss_frag_bytes / (audio_channels * (int)sizeof(int16_t));
+#endif
+    return 0;
+}
+
 int audio_queued_frames(void) {
     switch (current_backend) {
 #ifdef AUDIO_HAVE_OSS
@@ -201,6 +222,12 @@ static int audio_init_oss(int rate, int channels) {
     if (ioctl(fd, SNDCTL_DSP_RESET, 0) < 0)
         goto fail;
 
+    /* Must come before the format is set. Failing is not an error. */
+    {
+        int frag = AUDIO_OSS_FRAGMENT;
+        (void)ioctl(fd, SNDCTL_DSP_SETFRAGMENT, &frag);
+    }
+
     if (ioctl(fd, SNDCTL_DSP_SETFMT, &format) < 0)
         goto fail;
 
@@ -234,9 +261,20 @@ static int audio_init_oss(int rate, int channels) {
     audio_rate = actual_rate;
     audio_channels = actual_channels;
     current_backend = AUDIO_BACKEND_OSS;
+    oss_written = 0;
+    oss_frag_bytes = 0;
+    {
+        audio_buf_info bi;
+        if (ioctl(fd, SNDCTL_DSP_GETOSPACE, &bi) == 0 && bi.fragsize > 0)
+            oss_frag_bytes = bi.fragsize;
+    }
 
     fprintf(stderr, "Audio: OSS %d Hz, %d channel(s), S16_LE\n",
             audio_rate, audio_channels);
+    if (oss_frag_bytes > audio_rate * audio_channels * 2 / 10)
+        fprintf(stderr, "OSS: the driver uses large fragments (%.0f ms); "
+                "more audio is kept queued, so the output delay is higher\n",
+                oss_frag_bytes * 1000.0 / (audio_rate * audio_channels * 2));
 #ifdef DEBUG_TIMING
     {
         audio_buf_info bi;
@@ -270,11 +308,18 @@ static int audio_write_oss(const int16_t *pcm, int frames) {
 
     bytes = (size_t)frames * (size_t)audio_channels * sizeof(*pcm);
 
-    return write_all(oss_fd, pcm, bytes);
+    if (write_all(oss_fd, pcm, bytes) < 0)
+        return -1;
+    oss_written += (long long)bytes;
+    return 0;
 }
 
 /* Frames written but not yet played, or -1 if the driver cannot tell.
- * Many drivers only update this once per fragment, so callers should smooth it. */
+ * Many drivers only update this once per fragment, so callers should smooth it.
+ * Some only count full fragments: the part of a fragment still being filled is
+ * missing from their report. It is added here, so the result is never less than
+ * what is really queued; with drivers that do count it, it is up to one fragment
+ * more (callers keep one fragment extra queued for that). */
 static int audio_queued_oss(void) {
     int bytes = 0;
 
@@ -284,6 +329,13 @@ static int audio_queued_oss(void) {
         return -1;
     if (bytes < 0)
         bytes = 0;
+    if (oss_frag_bytes > 0) {
+        long long partial = oss_written % oss_frag_bytes;
+        if ((long long)bytes + partial > oss_written)
+            bytes = (int)oss_written;
+        else
+            bytes += (int)partial;
+    }
     return bytes / (audio_channels * (int)sizeof(int16_t));
 }
 
@@ -292,6 +344,8 @@ static void audio_close_oss(void) {
 		(void)ioctl(oss_fd, SNDCTL_DSP_SYNC, 0);
         close(oss_fd);
         oss_fd = -1;
+        oss_frag_bytes = 0;
+        oss_written = 0;
     }
 }
 #endif
